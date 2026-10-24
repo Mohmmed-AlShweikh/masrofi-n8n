@@ -1,0 +1,9 @@
+key,value,description,updated_at
+authorized_telegram_user_id,YOUR_TELEGRAM_USER_ID,Only this Telegram user can use the bot,
+telegram_chat_id,,Chat for scheduled reports (empty = same as authorized user),
+monthly_budget_ils,300,Monthly budget in selected currency,
+currency,ILS,Currency code,
+timezone,Asia/Gaza,IANA timezone for dates and reports,
+budget_alert_threshold_percent,100,Budget alert threshold percent,
+weekly_report_enabled,true,Enable weekly report,
+monthly_report_enabled,true,Enable monthly report,

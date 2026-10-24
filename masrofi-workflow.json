@@ -1,0 +1,4952 @@
+{
+  "name": "Masrofi",
+  "nodes": [
+    {
+      "parameters": {
+        "width": 560,
+        "height": 460,
+        "content": "## Masrofi — Arabic expense tracker\nTelegram bot + Google Sheets + Groq AI. Understands Palestinian-Arabic messages like `قهوة ب 5 ومناقيش ب 8`.\n\n### Setup (details in README)\n1. Create the Google Sheet with 5 tabs: Expenses, Settings, Categories, AuditLog, ReportLog (CSV templates in `sheets/`).\n2. In every Google Sheets node set **Document** = your sheet ID (search the canvas for `YOUR_GOOGLE_SHEET_ID`).\n3. Re-select credentials: Telegram, Google Sheets, Groq.\n4. In the Settings tab set `authorized_telegram_user_id` to your Telegram user ID (the bot ignores everyone else).\n5. In the **Notify Error** node replace `YOUR_TELEGRAM_CHAT_ID` with your chat ID (failure alerts).\n6. Publish the workflow (budget alerts and reports need it active)."
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -3700,
+        -400
+      ],
+      "id": "5a1f0a52-6c1e-4b8e-9d52-0b7a0c6f1a01",
+      "name": "Setup Notes"
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message",
+          "callback_query"
+        ],
+        "additionalFields": {}
+      },
+      "id": "2b50efb7-cacf-44d0-99a4-0623bb797c2e",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -3408,
+        608
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $('Telegram Trigger').first().json.message ?? {};\nconst text = String(src.text ?? '').trim();\nconst fromId = String(src.from?.id ?? '');\nconst chatId = String(src.chat?.id ?? '');\nconst messageId = String(src.message_id ?? '');\nconst settingsRows = $('Read Settings').all().map(x => x.json);\nconst settings = Object.fromEntries(settingsRows.map(r => [String(r.key || '').trim(), r.value]));\nconst tz = String(settings.timezone || 'Asia/Gaza');\nconst fmt = new Intl.DateTimeFormat('en-CA', {timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'});\nconst expenseDate = fmt.format(new Date());\nconst monthKey = expenseDate.slice(0,7);\nconst categories = $('Read Categories').all().map(x => x.json).filter(r => {\n  const v = String(r.enabled ?? 'TRUE').trim().toLowerCase();\n  return ['true','1','yes','نعم'].includes(v);\n});\nlet raw = $('AI Agent - Understand Palestinian Arabic').first().json.output ?? $('AI Agent - Understand Palestinian Arabic').first().json.text ?? '';\nif (typeof raw !== 'string') raw = JSON.stringify(raw);\nraw = raw.replace(/^```(?:json)?\\s*/i,'').replace(/\\s*```$/,'').trim();\nlet parsed = null;\ntry { parsed = JSON.parse(raw); } catch (e) { parsed = null; }\n\nconst reportActions = ['report_day','today','report_week','week','report_month','month'];\nconst common = {text,fromId,chatId,messageId,expenseDate,monthKey,authorizedUserId:String(settings.authorized_telegram_user_id || '').trim(),budget:Number(settings.monthly_budget_ils || 300),currency:String(settings.currency || 'ILS'),thresholdPercent:Number(settings.budget_alert_threshold_percent || 100),timezone:tz,weeklyReportEnabled:String(settings.weekly_report_enabled ?? 'true').toLowerCase() !== 'false',monthlyReportEnabled:String(settings.monthly_report_enabled ?? 'true').toLowerCase() !== 'false'};\n\n// ---- helpers: robust amount parsing + regex fallback ----\nconst toLatin = s => String(s ?? '')\n  .replace(/[\\u0660-\\u0669]/g, d => String(d.charCodeAt(0) - 0x0660))\n  .replace(/[\\u06F0-\\u06F9]/g, d => String(d.charCodeAt(0) - 0x06F0))\n  .replace(/\\u066B/g, '.');\nconst parseAmount = v => {\n  if (typeof v === 'number') return Number.isFinite(v) ? v : NaN;\n  const m = toLatin(v).match(/\\d+(?:\\.\\d+)?/);\n  return m ? Number(m[0]) : NaN;\n};\nfunction cleanItem(s) {\n  const stop = /(^|\\s)(?:جبت|اشتريت|شريت|دفعت|صرفت|حطيت|شيكل|شيكلات|ش|ILS|NIS|و|ب|بـ|ل)(?=\\s|$)/gi;\n  return String(s || '').replace(/[،,;؛:+\\-]+/g, ' ').replace(stop, ' ').replace(stop, ' ').replace(/\\s+/g, ' ').trim();\n}\nfunction regexExpenses(input) {\n  let t = toLatin(input).replace(/\\n/g, ' ، ').trim();\n  t = t.replace(/^\\s*(?:جبت|اشتريت|شريت|دفعت|صرفت)\\s+/, '');\n  const out = [];\n  let m;\n  if (/^\\d/.test(t)) {\n    const re = /(\\d+(?:\\.\\d+)?)\\s*([^\\d]*)/g;\n    while ((m = re.exec(t))) {\n      const item = cleanItem(m[2]); const amount = Number(m[1]);\n      if (item && amount > 0) out.push({ item, amount, category: '' });\n    }\n  } else {\n    const re = /([^\\d]+?)\\s*(\\d+(?:\\.\\d+)?)/g;\n    while ((m = re.exec(t))) {\n      const item = cleanItem(m[1]); const amount = Number(m[2]);\n      if (item && amount > 0) out.push({ item, amount, category: '' });\n    }\n  }\n  return out;\n}\n\nlet action = parsed ? String(parsed.action || 'unknown').trim() : 'unknown';\nlet sourceExpenses = (parsed && Array.isArray(parsed.expenses) ? parsed.expenses : [])\n  .map(e => ({ ...e, item: String(e?.item ?? '').trim(), amount: parseAmount(e?.amount) }));\nconst aiOk = action === 'expense' && sourceExpenses.length > 0 && sourceExpenses.every(e => e.item.length > 0 && Number.isFinite(e.amount) && e.amount > 0);\nconst hasDigit = /[0-9\\u0660-\\u0669\\u06F0-\\u06F9]/.test(text);\nlet usedFallback = false;\nif (!aiOk && !reportActions.includes(action) && action !== 'help' && hasDigit) {\n  const fb = regexExpenses(text);\n  if (fb.length > 0) { action = 'expense'; sourceExpenses = fb; usedFallback = true; }\n}\n\nif (!parsed && !usedFallback) {\n  return [{json:{...common,action:'unknown',expenses:[],valid:false,reply:'مش قادر أفهم الرسالة بشكل موثوق. جرّب: جبت بطاقة نت ب 2'}}];\n}\nconst clarification = parsed ? String(parsed.clarification || '') : '';\nif (action !== 'expense' || sourceExpenses.length === 0) {\n let reply = clarification;\n if (action === 'help') reply = 'أرسل مصروفًا مثل: جبت بطاقة نت ب 2. ويمكنك كتابة عدة مصاريف برسالة واحدة مثل: قهوة ب 5 ومناقيش ب 8. وللتراجع عن آخر تسجيل اكتب: تراجع';\n else if (reportActions.includes(action)) reply = '';\n else if (!reply) reply = 'ما ظهر عندي مصروف بمبلغ واضح. جرّب مثلًا: جبت بطاقة نت ب 2.';\n const normalizedAction = reportActions.includes(action) ? action : (action === 'help' ? 'help' : 'unknown');\n return [{json:{...common,action:normalizedAction,expenses:[],valid:false,reply,clarification}}];\n}\nfunction categoryFor(e) {\n  const item = String(e?.item || '').trim().toLowerCase();\n  const proposed = String(e?.category || '').trim();\n  for (const c of categories) {\n   const keys = String(c.keywords || '').split(/[،,;；]/).map(k=>k.trim().toLowerCase()).filter(Boolean);\n   if (keys.some(k => item.includes(k))) return String(c.category_name || 'غير مصنف').trim();\n  }\n  const exact = categories.find(c => String(c.category_name || '').trim() === proposed);\n  if (exact) return String(exact.category_name).trim();\n  const fallback = categories.find(c => String(c.category_name || '').trim() === 'غير مصنف') || categories.find(c => String(c.category_name || '').trim() === 'أخرى');\n  return String(fallback?.category_name || 'غير مصنف').trim();\n}\nconst expenses = sourceExpenses.map((e,i)=>{\n const item=String(e?.item || '').trim(); const amount=Number(e?.amount); const category=categoryFor(e);\n const valid=item.length>0 && Number.isFinite(amount) && amount>0;\n return {item,amount:valid?amount:null,category,valid,expenseIndex:i+1,expenseCount:sourceExpenses.length};\n});\nreturn [{json:{...common,action:'expense',expenses,valid:expenses.some(e=>e.valid),reply:'',usedFallback}}];"
+      },
+      "id": "3fdd1c09-280e-42e3-9e36-9a78a4eae40d",
+      "name": "Parse Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1488,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "auth1",
+              "leftValue": "={{ String($json.fromId).trim() === String($json.authorizedUserId).trim() && String($json.authorizedUserId).trim() !== '' && !String($json.authorizedUserId).includes('REPLACE_WITH') }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "5538ac86-1405-4aec-aa14-3b87eb0e7903",
+      "name": "Authorized User?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1264,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "exp1",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "expense",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f188fa9c-1a64-4270-9ac0-7baa4101d445",
+      "name": "Expense Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -816,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Expenses",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "f4343dc1-cf1c-42cd-a6de-5682af9eeaf2",
+      "name": "Read Expenses",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -592,
+        -64
+      ],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Parse Message').first().json;\nconst rows = $input.all().map(x => x.json);\nconst active = rows.filter(r =>\n  String(r.status || 'active').trim() === 'active' &&\n  String(r.month_key || '').slice(0, 7) === p.monthKey\n);\nconst currentTotal = active.reduce((sum, r) => sum + Number(r.amount_ils || r.amount || 0), 0);\n\nconst expenses = Array.isArray(p.expenses) ? p.expenses : [];\nconst toSave = [];\nconst duplicates = [];\nconst invalid = [];\n\nfor (const e of expenses) {\n  if (!e.valid || !e.item || !Number.isFinite(Number(e.amount)) || Number(e.amount) <= 0) {\n    invalid.push(e);\n    continue;\n  }\n\n  const expenseId = `m-${p.fromId}-${p.messageId}-${e.expenseIndex}`;\n  const duplicate = rows.some(r => String(r.expense_id || '') === expenseId);\n  if (duplicate) {\n    duplicates.push(e);\n    continue;\n  }\n\n  toSave.push({\n    ...p,\n    ...e,\n    expense_id: expenseId,\n    created_at: new Date().toISOString(),\n    updated_at: new Date().toISOString(),\n    status: 'active'\n  });\n}\n\nif (toSave.length === 0) {\n  let reply;\n  if (duplicates.length > 0 && invalid.length === 0) {\n    reply = '⚠️ هذه المصاريف مسجلة من قبل، فما كررتها.';\n  } else {\n    reply = 'ما قدرت أسجل أي مصروف؛ تأكد إن كل غرض معه مبلغ واضح. مثال: قهوة ب 5 ومناقيش ب 8.';\n  }\n  return [{ json: { ...p, ok: false, reply } }];\n}\n\nconst newTotal = toSave.reduce((sum, e) => sum + Number(e.amount), 0);\nconst totalAfter = currentTotal + newTotal;\nconst budget = Number(p.budget || 300);\nconst remaining = budget - totalAfter;\nconst cur = p.currency || 'ILS';\nconst fmtN = v => Number.isInteger(v) ? String(v) : v.toFixed(2);\n\n// ---- where the money goes this month (existing + new) ----\nconst catTotals = {};\nconst itemTotals = {};\nconst addTo = (map, key, amt) => { const k = String(key || '').trim(); if (!k) return; map[k] = (map[k] || 0) + amt; };\nfor (const r of active) {\n  const amt = Number(r.amount_ils || r.amount || 0);\n  addTo(catTotals, r.category || 'أخرى', amt);\n  addTo(itemTotals, r.item, amt);\n}\nfor (const e of toSave) {\n  const amt = Number(e.amount);\n  addTo(catTotals, e.category || 'أخرى', amt);\n  addTo(itemTotals, e.item, amt);\n}\nconst topCats = Object.entries(catTotals).sort((a, b) => b[1] - a[1]).slice(0, 3);\nconst topItem = Object.entries(itemTotals).sort((a, b) => b[1] - a[1])[0];\nconst medals = ['🥇', '🥈', '🥉'];\n\nconst lines = [\n  '✅ تم تسجيل المصروفات بنجاح!',\n  `📌 عدد المصاريف الجديدة: ${toSave.length}`,\n  ...toSave.map(e => `🛍️ ${e.item} (${e.category}): ${e.amount} ${cur}`),\n  `💵 مجموع المصاريف الجديدة: ${newTotal} ${cur}`,\n  `📊 مصاريف الشهر: ${totalAfter} ${cur}`,\n  `💰 الميزانية: ${budget} ${cur}`,\n  remaining >= 0\n    ? `🟢 ضايلك: ${remaining} ${cur}`\n    : `🔴 متجاوز الميزانية بـ ${Math.abs(remaining)} ${cur}`\n];\n\nif (topCats.length) {\n  lines.push('', '📈 وين بتروح مصاريفك هالشهر:');\n  topCats.forEach(([c, v], i) => {\n    const pct = totalAfter > 0 ? Math.round(v / totalAfter * 100) : 0;\n    lines.push(`${medals[i]} ${c}: ${fmtN(v)} ${cur} (${pct}%)`);\n  });\n  if (topItem) lines.push(`🔝 أكثر غرض بتصرف عليه: ${topItem[0]} (${fmtN(topItem[1])} ${cur})`);\n}\n\nif (duplicates.length) {\n  lines.push(`⚠️ تم تجاهل ${duplicates.length} مصروف مكرر.`);\n}\nif (invalid.length) {\n  lines.push(`⚠️ تم تجاهل ${invalid.length} مصروف غير واضح.`);\n}\nlines.push('', '↩️ للتراجع عن هذا التسجيل اكتب: تراجع');\n\nconst reply = lines.join('\\n');\nreturn toSave.map(e => ({\n  json: {\n    ...e,\n    ok: true,\n    total_after: totalAfter,\n    new_total: newTotal,\n    reply\n  }\n}));"
+      },
+      "id": "70484ab8-14e5-4643-b6a5-7077b0760f5d",
+      "name": "Validate and Calculate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -368,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ok1",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "bb46e672-0c3f-45bf-9751-66294fc22373",
+      "name": "Valid New Expense?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -144,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Expenses",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "expense_id": "={{ $json.expense_id }}",
+            "created_at": "={{ $json.created_at }}",
+            "expense_date": "={{ $json.expenseDate }}",
+            "user_id": "={{ $json.fromId }}",
+            "category": "={{ $json.category }}",
+            "amount_ils": "={{ $json.amount }}",
+            "item": "={{ $json.item }}",
+            "original_text": "={{ $json.text }}",
+            "telegram_message_id": "={{ $json.messageId }}",
+            "month_key": "={{ $json.monthKey }}",
+            "updated_at": "={{ $now.toISO() }}",
+            "status": "active"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "expense_id",
+              "displayName": "expense_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "expense_date",
+              "displayName": "expense_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "month_key",
+              "displayName": "month_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "user_id",
+              "displayName": "user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "item",
+              "displayName": "item",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "amount_ils",
+              "displayName": "amount_ils",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "category",
+              "displayName": "category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "original_text",
+              "displayName": "original_text",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "telegram_message_id",
+              "displayName": "telegram_message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "updated_at",
+              "displayName": "updated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "reversal_of",
+              "displayName": "reversal_of",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "notes",
+              "displayName": "notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "14f54b1d-15b9-427e-9459-3c51ef58fffe",
+      "name": "Append Expense",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        80,
+        -64
+      ],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "c286de66-cc70-48f3-baff-d63db49378f8",
+      "name": "Reply After Save",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        528,
+        -256
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Parse Message').item.json.chatId }}",
+        "text": "={{ (/[\\u0600-\\u06FF]/.test($json.reply || '') && !/[A-Za-z]{3,}/.test($json.reply || '')) ? $json.reply : 'ما فهمت الرسالة. جرّب مثلًا: جبت بطاقة نت ب 2، أو اكتب: وين بتروح مصاري؟' }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "fcf7109d-54a4-4826-ad63-2408ebcd4bce",
+      "name": "Reply Clarification",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        80,
+        -256
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Parse Message').item.json.chatId }}",
+        "text": "عذرًا، هذا البوت خاص بصاحبه وما عندك صلاحية تستخدمه.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ccb38da5-03fc-408f-a0eb-97b4293dc55f",
+      "name": "Reject Unauthorized",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1040,
+        800
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $('Telegram Trigger').first().json.message.text }}",
+        "options": {
+          "systemMessage": "أنت مساعد متخصص في استخراج المصاريف من اللهجة الفلسطينية وتصنيف طلبات المستخدم.\n\nأخرج JSON صالحًا فقط، دون Markdown أو أي نص خارج JSON.\n\nاستخدم أحد المخططات التالية حسب نوع الرسالة:\n\n1. المصاريف:\n{\"action\":\"expense\",\"expenses\":[{\"item\":\"قهوة\",\"amount\":5,\"category\":\"أكل وحلويات\"}],\"clarification\":\"\"}\n\n2. تقرير اليوم:\n{\"action\":\"report_day\",\"expenses\":[],\"clarification\":\"\"}\n\n3. التقرير الأسبوعي:\n{\"action\":\"report_week\",\"expenses\":[],\"clarification\":\"\"}\n\n4. التقرير الشهري:\n{\"action\":\"report_month\",\"expenses\":[],\"clarification\":\"\"}\n\n5. المساعدة:\n{\"action\":\"help\",\"expenses\":[],\"clarification\":\"\"}\n\n6. رسالة غير واضحة أو غير مدعومة:\n{\"action\":\"unknown\",\"expenses\":[],\"clarification\":\"\"}\n\nقواعد تحديد الإجراء:\n- إذا طلب المستخدم تقريرًا أسبوعيًا، مثل \"تقرير أسبوعي\" أو \"تقرير اسبوعي\" أو \"مصاريف الأسبوع\"، استخدم report_week.\n- إذا طلب تقريرًا شهريًا، مثل \"تقرير شهري\" أو \"مصاريف الشهر\"، استخدم report_month.\n- إذا طلب مصاريف اليوم أو تقرير اليوم، استخدم report_day.\n- إذا سأل عن طريقة استخدام البوت أو طلب المساعدة، استخدم help.\n- إذا ذكر مصروفًا أو عدة مصاريف، استخدم expense.\n- لا تعتبر طلب التقرير مصروفًا.\n- لا تضف مصاريف وهمية إلى طلب التقرير.\n- لا تحسب المجموع أو الميزانية؛ هذه مهمة الـ workflow.\n\nقواعد استخراج المصاريف:\n- استخرج جميع المصاريف المذكورة، وليس المصروف الأول فقط.\n- كل غرض مع مبلغه يمثل مصروفًا مستقلًا.\n- حافظ على ترتيب المصاريف كما وردت.\n- حوّل الأرقام العربية والهندية إلى أرقام عادية.\n- لا تجمع المبالغ في مصروف واحد، ولا تحذف أي غرض.\n- لا تخترع أغراضًا أو مبالغ.\n- إذا كان المبلغ غير واضح، اطلب التوضيح باستخدام clarification.\n- استخدم إحدى الفئات التالية فقط: أكل وحلويات، مواصلات، إنترنت واتصالات، بيت وفواتير، صحة وأدوية، أغراض شخصية، تعليم وعمل، ترفيه، أخرى، غير مصنف.\n\nأمثلة إلزامية:\n\nالرسالة: جبت قهوة ب5 ومناقيش ب8\nالنتيجة:\n{\"action\":\"expense\",\"expenses\":[{\"item\":\"قهوة\",\"amount\":5,\"category\":\"أكل وحلويات\"},{\"item\":\"مناقيش\",\"amount\":8,\"category\":\"أكل وحلويات\"}],\"clarification\":\"\"}\n\nالرسالة: تكسي 12 واشتريت خبز 4\nالنتيجة:\n{\"action\":\"expense\",\"expenses\":[{\"item\":\"تكسي\",\"amount\":12,\"category\":\"مواصلات\"},{\"item\":\"خبز\",\"amount\":4,\"category\":\"أكل وحلويات\"}],\"clarification\":\"\"}\n\nالرسالة: تقرير أسبوعي\nالنتيجة:\n{\"action\":\"report_week\",\"expenses\":[],\"clarification\":\"\"}\n\nالرسالة: تقرير اسبوعي\nالنتيجة:\n{\"action\":\"report_week\",\"expenses\":[],\"clarification\":\"\"}\n\nالرسالة: تقرير شهري\nالنتيجة:\n{\"action\":\"report_month\",\"expenses\":[],\"clarification\":\"\"}\n\nالرسالة: مصاريف اليوم\nالنتيجة:\n{\"action\":\"report_day\",\"expenses\":[],\"clarification\":\"\"}\n\nالرسالة: مساعدة\nالنتيجة:\n{\"action\":\"help\",\"expenses\":[],\"clarification\":\"\"}\n\nالتزم دائمًا بإرجاع JSON صالح فقط، وبالمخطط المناسب للإجراء المطلوب."
+        }
+      },
+      "id": "46e9d8b9-f7f8-4863-8e62-ba31fea68eb1",
+      "name": "AI Agent - Understand Palestinian Arabic",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        -2064,
+        656
+      ]
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-20b",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        -1992,
+        872
+      ],
+      "id": "f1c99e91-d0eb-4b0a-9b2d-25ba4a9db23e",
+      "name": "Groq Chat Model",
+      "credentials": {
+        "groqApi": {
+          "id": "REPLACE_ME",
+          "name": "Groq account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Validate and Calculate').first().json;\nreturn [{\n  json: {\n    chatId: p.chatId,\n    reply: p.reply,\n    monthKey: p.monthKey,\n    totalAfter: Number(p.total_after || 0),\n    budget: Number(p.budget || 300), thresholdPercent: Number(p.thresholdPercent || 100), currency: p.currency || 'ILS'\n  }\n}];"
+      },
+      "id": "c7d4bf3d-f9cb-459c-a66d-ed6da71a688b",
+      "name": "Build Single Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        304,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst state = $getWorkflowStaticData('global');\nconst monthKey = String(item.monthKey || '');\nconst totalAfter = Number(item.totalAfter || 0);\nconst budget = Number(item.budget || 300);\nconst thresholdPercent = Number(item.thresholdPercent ?? 100);\nconst currency = String(item.currency || 'ILS');\nconst alertLevel = budget * thresholdPercent / 100;\nconst shouldAlert = Boolean(monthKey) &&\n  totalAfter >= alertLevel &&\n  state.lastBudgetAlertMonth !== monthKey;\nreturn [{ json: {\n  chatId: item.chatId,\n  monthKey,\n  totalAfter,\n  budget,\n  thresholdPercent,\n  shouldAlert,\n  alertText: `⚠️ تنبيه الميزانية الشهرية\\nوصلت مصاريفك إلى ${totalAfter.toFixed(2)} ${currency} من ميزانية ${budget} ${currency} (حد التنبيه ${thresholdPercent}%).\\n${totalAfter > budget ? `تجاوزت الميزانية بـ ${(totalAfter - budget).toFixed(2)} ${currency}.` : 'وصلت إلى حد الميزانية.'}`\n}}];"
+      },
+      "id": "52e6c611-d85e-4806-84b5-8c7490d01c68",
+      "name": "Budget Alert Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        528,
+        32
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "budget-alert-due",
+              "leftValue": "={{ $json.shouldAlert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "aa8680d6-3cb0-43a5-9db4-965a2c3bac68",
+      "name": "Budget Alert Due?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        752,
+        32
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.alertText }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "6a1e94ff-d43b-4bd0-8824-be9bfb3b2e5b",
+      "name": "Send Budget Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        976,
+        32
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $('Budget Alert Gate').first().json;\nconst state = $getWorkflowStaticData('global');\nstate.lastBudgetAlertMonth = item.monthKey;\nreturn [{ json: { ok: true, monthKey: item.monthKey } }];"
+      },
+      "id": "02d5072a-2c73-456b-ba7f-72ee0639efc1",
+      "name": "Mark Budget Alert Sent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        32
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "5427543d-260d-454d-b7f3-76b13e212e20",
+      "name": "Weekly Report Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1488,
+        1280
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Expenses",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "d6b0dd34-8a48-457c-8844-fecc99725e0f",
+      "name": "Read Expenses for Weekly Report",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -592,
+        1232
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(x => x.json);\nlet currency = 'ILS'; try { const sr = $('Read Settings for Weekly Report').all().map(x=>x.json); currency = String(Object.fromEntries(sr.map(r=>[String(r.key||'').trim(),r.value])).currency || 'ILS'); } catch(e) {}\nlet cfg;\ntry { cfg = $('Prepare Weekly Settings').first().json; } catch (e) {\n  const rows = $('Read Settings').all().map(x => x.json);\n  const settings = Object.fromEntries(rows.map(r => [String(r.key || '').trim(), r.value]));\n  const rawChat = String(settings.telegram_chat_id || '').trim();\n  cfg = {timezone: settings.timezone || 'Asia/Gaza', chatId: (!rawChat || rawChat.includes('REPLACE_WITH')) ? String(settings.authorized_telegram_user_id || '').trim() : rawChat};\n}\nconst tz = cfg.timezone || 'Asia/Gaza';\nconst today = new Intl.DateTimeFormat('en-CA', {\n  timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'\n}).format(new Date());\nconst date0 = new Date(`${today}T00:00:00Z`);\nconst dayMs = 24 * 60 * 60 * 1000;\nconst start = new Date(date0.getTime() - 7 * dayMs).toISOString().slice(0, 10);\nconst end = new Date(date0.getTime() - dayMs).toISOString().slice(0, 10);\nconst active = rows.filter(r =>\n  String(r.status || 'active').trim() === 'active' &&\n  String(r.expense_date || '').slice(0, 10) >= start &&\n  String(r.expense_date || '').slice(0, 10) <= end\n);\nconst total = active.reduce((s, r) => s + Number(r.amount_ils || r.amount || 0), 0);\nconst cats = {};\nfor (const r of active) {\n  const c = String(r.category || 'أخرى');\n  cats[c] = (cats[c] || 0) + Number(r.amount_ils || r.amount || 0);\n}\nconst catLines = Object.entries(cats)\n  .sort((a,b) => b[1]-a[1])\n  .map(([c,v]) => `• ${c}: ${v.toFixed(2)} ${currency}`);\nconst text = [\n  '📊 الملخص الأسبوعي لمصروفي',\n  `📅 الفترة: ${start} إلى ${end}`,\n  `🧾 عدد المصاريف: ${active.length}`,\n  `💸 مجموع الأسبوع: ${total.toFixed(2)} ${currency}`,\n  '',\n  '📂 حسب الفئة:',\n  ...(catLines.length ? catLines : ['• لا توجد مصاريف مسجلة خلال هذه الفترة.'])\n].join('\\n');\nreturn [{ json: { chatId: cfg.chatId, report: text, start, end, total, count: active.length } }];"
+      },
+      "id": "4a644bbb-48b1-444e-89b1-0917cf49f800",
+      "name": "Build Weekly Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -368,
+        1232
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.report }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "a2de7a50-bbe2-456b-948f-6b9d7e98de90",
+      "name": "Send Weekly Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        80,
+        1232
+      ],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 1 * *"
+            }
+          ]
+        }
+      },
+      "id": "f9f94474-9fa1-4f81-b370-629fce9e480b",
+      "name": "Monthly Report Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -3408,
+        1648
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Expenses",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "71b4bb34-6e75-45fd-b843-29043fcee0c4",
+      "name": "Read Expenses for Monthly Report",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -2512,
+        1648
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(x => x.json);\nlet currency = 'ILS'; try { const sr = $('Read Settings for Monthly Report').all().map(x=>x.json); currency = String(Object.fromEntries(sr.map(r=>[String(r.key||'').trim(),r.value])).currency || 'ILS'); } catch(e) {}\nconst cfg = $('Prepare Monthly Settings').first().json;\nconst today = new Intl.DateTimeFormat('en-CA', {\n  timeZone: cfg.timezone || 'Asia/Gaza', year: 'numeric', month: '2-digit', day: '2-digit'\n}).format(new Date());\nconst currentMonth = today.slice(0, 7);\nconst firstThisMonth = new Date(`${currentMonth}-01T00:00:00Z`);\nconst previousMonthDate = new Date(firstThisMonth.getTime() - 24 * 60 * 60 * 1000);\nconst previousMonth = previousMonthDate.toISOString().slice(0, 7);\nconst active = rows.filter(r =>\n  String(r.status || 'active').trim() === 'active' &&\n  String(r.month_key || r.expense_date || '').slice(0, 7) === previousMonth\n);\nconst total = active.reduce((s, r) => s + Number(r.amount_ils || r.amount || 0), 0);\nconst cats = {};\nfor (const r of active) {\n  const c = String(r.category || 'أخرى');\n  cats[c] = (cats[c] || 0) + Number(r.amount_ils || r.amount || 0);\n}\nconst catLines = Object.entries(cats)\n  .sort((a,b) => b[1]-a[1])\n  .map(([c,v]) => `• ${c}: ${v.toFixed(2)} ${currency}`);\nconst text = [\n  '🗓️ ملخص مصاريف الشهر السابق',\n  `📅 الشهر: ${previousMonth}`,\n  `🧾 عدد المصاريف: ${active.length}`,\n  `💸 مجموع الشهر: ${total.toFixed(2)} ${currency}`,\n  `📉 متوسط المصروف لكل عملية: ${active.length ? (total / active.length).toFixed(2) : '0.00'} ${currency}`,\n  '',\n  '📂 حسب الفئة:',\n  ...(catLines.length ? catLines : ['• لا توجد مصاريف مسجلة في الشهر السابق.'])\n].join('\\n');\nreturn [{ json: { chatId: $('Prepare Monthly Settings').first().json.chatId, report: text, month: previousMonth, total, count: active.length } }];"
+      },
+      "id": "50b657dd-d709-433b-b353-8d8e9adfbe06",
+      "name": "Build Monthly Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2288,
+        1648
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.report }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "776febd6-a2da-4518-9501-1d8bf5069ef7",
+      "name": "Send Monthly Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1840,
+        1648
+      ],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "exp1",
+              "leftValue": "={{ ['report_day','today','report_week','week','report_month','month'].includes($json.action) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e88a4fe8-1574-4a78-9c82-8461a1e1dd54",
+      "name": "Report Request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1040,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "exp1",
+              "leftValue": "={{ ['report_week','week'].includes($json.action) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b5c33758-c170-4d7d-9402-b5aac60ad5ae",
+      "name": "Weekly Report Request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -816,
+        656
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "exp1",
+              "leftValue": "={{ ['report_month','month'].includes($json.action) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e38aae94-68e1-4139-805d-2a11da0f1831",
+      "name": "Monthly Report Request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -592,
+        608
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Expenses",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "e6784e14-1c26-4cc8-b000-dfc4215e17b9",
+      "name": "Read Expenses for Manual Monthly Report",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -368,
+        416
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Expenses",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "5c67e90b-d7d4-4e6d-a84b-f52e17ff6b73",
+      "name": "Read Expenses for Daily Report",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -368,
+        800
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(x => x.json);\nconst currency = String($('Parse Message').first().json.currency || 'ILS');\nconst p = $('Parse Message').first().json;\nconst month = p.monthKey;\nconst active = rows.filter(r =>\n  String(r.status || 'active').trim() === 'active' &&\n  String(r.month_key || r.expense_date || '').slice(0, 7) === month\n);\nconst total = active.reduce((s, r) => s + Number(r.amount_ils || r.amount || 0), 0);\nconst cats = {};\nfor (const r of active) {\n  const c = String(r.category || 'أخرى');\n  cats[c] = (cats[c] || 0) + Number(r.amount_ils || r.amount || 0);\n}\nconst catLines = Object.entries(cats).sort((a,b) => b[1]-a[1])\n  .map(([c,v]) => `• ${c}: ${v.toFixed(2)} ${currency}`);\nconst text = [\n  '🗓️ ملخص مصاريف الشهر الحالي',\n  `📅 الشهر: ${month}`,\n  `🧾 عدد المصاريف: ${active.length}`,\n  `💸 مجموع الشهر: ${total.toFixed(2)} ${currency}`,\n  `📉 متوسط المصروف لكل عملية: ${active.length ? (total / active.length).toFixed(2) : '0.00'} ${currency}`,\n  '', '📂 حسب الفئة:',\n  ...(catLines.length ? catLines : ['• لا توجد مصاريف مسجلة في الشهر الحالي.'])\n].join('\\n');\nreturn [{ json: { chatId: p.chatId, report: text, month, total, count: active.length } }];"
+      },
+      "id": "82d3c924-ed0d-4e24-900b-1135cde082f0",
+      "name": "Build Manual Monthly Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -144,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(x => x.json);\nconst currency = String($('Parse Message').first().json.currency || 'ILS');\nconst p = $('Parse Message').first().json;\nconst day = p.expenseDate;\nconst active = rows.filter(r =>\n  String(r.status || 'active').trim() === 'active' &&\n  String(r.expense_date || '').slice(0, 10) === day\n);\nconst total = active.reduce((s, r) => s + Number(r.amount_ils || r.amount || 0), 0);\nconst cats = {};\nfor (const r of active) {\n  const c = String(r.category || 'أخرى');\n  cats[c] = (cats[c] || 0) + Number(r.amount_ils || r.amount || 0);\n}\nconst catLines = Object.entries(cats).sort((a,b) => b[1]-a[1])\n  .map(([c,v]) => `• ${c}: ${v.toFixed(2)} ${currency}`);\nconst detailLines = active.map(r => `• ${String(r.item || 'مصروف')}: ${Number(r.amount_ils || r.amount || 0).toFixed(2)} ${currency}`);\nconst text = [\n  '📊 تقرير مصاريف اليوم',\n  `📅 التاريخ: ${day}`,\n  `🧾 عدد المصاريف: ${active.length}`,\n  `💸 مجموع اليوم: ${total.toFixed(2)} ${currency}`,\n  '',\n  '🛍️ المصاريف:',\n  ...(detailLines.length ? detailLines : ['• لا توجد مصاريف مسجلة اليوم.']),\n  '', '📂 حسب الفئة:',\n  ...(catLines.length ? catLines : ['• لا توجد بيانات للتصنيف اليوم.'])\n].join('\\n');\nreturn [{ json: { chatId: p.chatId, report: text, day, total, count: active.length } }];"
+      },
+      "id": "9b2337f3-97fd-4f47-86d3-dddea24738a8",
+      "name": "Build Daily Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -144,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.report }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "088873b1-da53-47ae-bb96-3ac01ee1d711",
+      "name": "Send Manual Monthly Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        304,
+        416
+      ],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.report }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "182b9f40-b6aa-450a-a383-6fcb43181845",
+      "name": "Send Daily Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        304,
+        800
+      ],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Settings",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "6ec78fa6-2b32-418b-8358-e8d96af29b66",
+      "name": "Read Settings",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -2736,
+        1056
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Categories",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "bfcb015c-364b-4d93-8abe-03886d57ac83",
+      "name": "Read Categories",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -1712,
+        752
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "AuditLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_id": "={{ 'evt-' + $execution.id + '-' + $('Validate and Calculate').item.json.expenseIndex }}",
+            "timestamp": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "user_id": "={{ $('Validate and Calculate').item.json.fromId }}",
+            "action": "expense_create",
+            "expense_id": "={{ $('Validate and Calculate').item.json.expense_id }}",
+            "result": "success",
+            "details": "={{ 'Saved item=' + $('Validate and Calculate').item.json.item + '; amount=' + $('Validate and Calculate').item.json.amount + '; category=' + $('Validate and Calculate').item.json.category }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "event_id",
+              "displayName": "event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "user_id",
+              "displayName": "user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "action",
+              "displayName": "action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "expense_id",
+              "displayName": "expense_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "result",
+              "displayName": "result",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "details",
+              "displayName": "details",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "f733872b-b7ad-40d5-afad-6d0d256d465b",
+      "name": "AuditLog - Expense Saved",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        304,
+        -352
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "AuditLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_id": "={{ 'evt-fail-' + $execution.id + '-' + Date.now() }}",
+            "timestamp": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "user_id": "={{ $('Validate and Calculate').first().json.fromId }}",
+            "action": "expense_create",
+            "expense_id": "={{ $('Validate and Calculate').first().json.expense_id || '' }}",
+            "result": "failure",
+            "details": "={{ 'Expenses append failed. Check Google Sheets node execution; message=' + String($json.error?.message || $json.message || 'unknown').slice(0,300) }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "event_id",
+              "displayName": "event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "user_id",
+              "displayName": "user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "action",
+              "displayName": "action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "expense_id",
+              "displayName": "expense_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "result",
+              "displayName": "result",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "details",
+              "displayName": "details",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "456dde4d-feb0-4035-b629-6e42be8f54ab",
+      "name": "AuditLog - Expense Save Failed",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        304,
+        224
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "AuditLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_id": "={{ 'evt-auth-' + $execution.id }}",
+            "timestamp": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "user_id": "={{ $('Parse Message').first().json.fromId }}",
+            "action": "authorization_rejected",
+            "expense_id": "",
+            "result": "failure",
+            "details": "={{ 'Unauthorized Telegram user attempted action=' + String($('Parse Message').first().json.action || 'unknown') }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "event_id",
+              "displayName": "event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "user_id",
+              "displayName": "user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "action",
+              "displayName": "action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "expense_id",
+              "displayName": "expense_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "result",
+              "displayName": "result",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "details",
+              "displayName": "details",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "5d328c20-7ee8-4ff3-bd53-6088fdd70a09",
+      "name": "AuditLog - Unauthorized",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -1040,
+        1088
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Parse Message').first().json.chatId }}",
+        "text": "تعذّر حفظ المصروف في Google Sheets. لم أؤكد تسجيله؛ جرّب مرة ثانية بعد قليل.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "bc7dcd49-afff-48c9-9c0c-3941b3bac899",
+      "name": "Reply - Expense Save Failed",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        304,
+        32
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Build Weekly Report').first().json;\nreturn [{json: {...p, reportType: 'weekly', periodStart: p.start || p.day || (p.month ? p.month + '-01' : ''), periodEnd: p.end || p.day || (p.month ? new Date(Date.UTC(Number(p.month.slice(0,4)), Number(p.month.slice(5,7)), 0)).toISOString().slice(0,10) : ''), total: Number(p.total || 0)}}];"
+      },
+      "id": "8e28bd93-7e2d-48f6-bc5c-834021577138",
+      "name": "Prepare ReportLog weekly",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -144,
+        1232
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "ReportLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "report_id": "={{ 'rpt-' + $execution.id + '-weekly' }}",
+            "generated_at": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "report_type": "weekly",
+            "period_start": "={{ $('Prepare ReportLog weekly').first().json.periodStart }}",
+            "period_end": "={{ $('Prepare ReportLog weekly').first().json.periodEnd }}",
+            "total_ils": "={{ $('Prepare ReportLog weekly').first().json.total }}",
+            "delivery_status": "sent"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "report_id",
+              "displayName": "report_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "generated_at",
+              "displayName": "generated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "report_type",
+              "displayName": "report_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_start",
+              "displayName": "period_start",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_end",
+              "displayName": "period_end",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total_ils",
+              "displayName": "total_ils",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "delivery_status",
+              "displayName": "delivery_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "18e26d67-914c-467d-ba0a-927e4a0c9725",
+      "name": "ReportLog - weekly Sent",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        304,
+        992
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "ReportLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "report_id": "={{ 'rpt-' + $execution.id + '-weekly' }}",
+            "generated_at": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "report_type": "weekly",
+            "period_start": "={{ $('Prepare ReportLog weekly').first().json.periodStart }}",
+            "period_end": "={{ $('Prepare ReportLog weekly').first().json.periodEnd }}",
+            "total_ils": "={{ $('Prepare ReportLog weekly').first().json.total }}",
+            "delivery_status": "failed"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "report_id",
+              "displayName": "report_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "generated_at",
+              "displayName": "generated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "report_type",
+              "displayName": "report_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_start",
+              "displayName": "period_start",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_end",
+              "displayName": "period_end",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total_ils",
+              "displayName": "total_ils",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "delivery_status",
+              "displayName": "delivery_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "9975719d-b991-495b-b8b0-23ed4d67d526",
+      "name": "ReportLog - weekly Failed",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        304,
+        1328
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Build Monthly Report').first().json;\nreturn [{json: {...p, reportType: 'monthly', periodStart: p.start || p.day || (p.month ? p.month + '-01' : ''), periodEnd: p.end || p.day || (p.month ? new Date(Date.UTC(Number(p.month.slice(0,4)), Number(p.month.slice(5,7)), 0)).toISOString().slice(0,10) : ''), total: Number(p.total || 0)}}];"
+      },
+      "id": "66448333-84ec-419e-b192-542568acedaf",
+      "name": "Prepare ReportLog monthly",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2064,
+        1648
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "ReportLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "report_id": "={{ 'rpt-' + $execution.id + '-monthly' }}",
+            "generated_at": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "report_type": "monthly",
+            "period_start": "={{ $('Prepare ReportLog monthly').first().json.periodStart }}",
+            "period_end": "={{ $('Prepare ReportLog monthly').first().json.periodEnd }}",
+            "total_ils": "={{ $('Prepare ReportLog monthly').first().json.total }}",
+            "delivery_status": "sent"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "report_id",
+              "displayName": "report_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "generated_at",
+              "displayName": "generated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "report_type",
+              "displayName": "report_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_start",
+              "displayName": "period_start",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_end",
+              "displayName": "period_end",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total_ils",
+              "displayName": "total_ils",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "delivery_status",
+              "displayName": "delivery_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "0acff686-1a83-4683-9ab5-61ff994bb4a7",
+      "name": "ReportLog - monthly Sent",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -1616,
+        1552
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "ReportLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "report_id": "={{ 'rpt-' + $execution.id + '-monthly' }}",
+            "generated_at": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "report_type": "monthly",
+            "period_start": "={{ $('Prepare ReportLog monthly').first().json.periodStart }}",
+            "period_end": "={{ $('Prepare ReportLog monthly').first().json.periodEnd }}",
+            "total_ils": "={{ $('Prepare ReportLog monthly').first().json.total }}",
+            "delivery_status": "failed"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "report_id",
+              "displayName": "report_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "generated_at",
+              "displayName": "generated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "report_type",
+              "displayName": "report_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_start",
+              "displayName": "period_start",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_end",
+              "displayName": "period_end",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total_ils",
+              "displayName": "total_ils",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "delivery_status",
+              "displayName": "delivery_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "e776238d-325d-44a5-addd-f576c4aecc6f",
+      "name": "ReportLog - monthly Failed",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -1616,
+        1744
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Build Manual Monthly Report').first().json;\nreturn [{json: {...p, reportType: 'manual_monthly', periodStart: p.start || p.day || (p.month ? p.month + '-01' : ''), periodEnd: p.end || p.day || (p.month ? new Date(Date.UTC(Number(p.month.slice(0,4)), Number(p.month.slice(5,7)), 0)).toISOString().slice(0,10) : ''), total: Number(p.total || 0)}}];"
+      },
+      "id": "7e0166d4-51b8-4577-b42e-d15891865b02",
+      "name": "Prepare ReportLog manual_monthly",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "ReportLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "report_id": "={{ 'rpt-' + $execution.id + '-manual_monthly' }}",
+            "generated_at": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "report_type": "manual_monthly",
+            "period_start": "={{ $('Prepare ReportLog manual_monthly').first().json.periodStart }}",
+            "period_end": "={{ $('Prepare ReportLog manual_monthly').first().json.periodEnd }}",
+            "total_ils": "={{ $('Prepare ReportLog manual_monthly').first().json.total }}",
+            "delivery_status": "sent"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "report_id",
+              "displayName": "report_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "generated_at",
+              "displayName": "generated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "report_type",
+              "displayName": "report_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_start",
+              "displayName": "period_start",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_end",
+              "displayName": "period_end",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total_ils",
+              "displayName": "total_ils",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "delivery_status",
+              "displayName": "delivery_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "6f3ab89e-c5a1-4429-a0f7-55e5d3a57dec",
+      "name": "ReportLog - manual_monthly Sent",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        528,
+        224
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "ReportLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "report_id": "={{ 'rpt-' + $execution.id + '-manual_monthly' }}",
+            "generated_at": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "report_type": "manual_monthly",
+            "period_start": "={{ $('Prepare ReportLog manual_monthly').first().json.periodStart }}",
+            "period_end": "={{ $('Prepare ReportLog manual_monthly').first().json.periodEnd }}",
+            "total_ils": "={{ $('Prepare ReportLog manual_monthly').first().json.total }}",
+            "delivery_status": "failed"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "report_id",
+              "displayName": "report_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "generated_at",
+              "displayName": "generated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "report_type",
+              "displayName": "report_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_start",
+              "displayName": "period_start",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_end",
+              "displayName": "period_end",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total_ils",
+              "displayName": "total_ils",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "delivery_status",
+              "displayName": "delivery_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "f5b91250-2d95-440e-83a2-81ded0064b81",
+      "name": "ReportLog - manual_monthly Failed",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        528,
+        512
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Build Daily Report').first().json;\nreturn [{json: {...p, reportType: 'daily', periodStart: p.start || p.day || (p.month ? p.month + '-01' : ''), periodEnd: p.end || p.day || (p.month ? new Date(Date.UTC(Number(p.month.slice(0,4)), Number(p.month.slice(5,7)), 0)).toISOString().slice(0,10) : ''), total: Number(p.total || 0)}}];"
+      },
+      "id": "f64ac57d-65ab-40bb-86a1-4c89682d87a8",
+      "name": "Prepare ReportLog daily",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "ReportLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "report_id": "={{ 'rpt-' + $execution.id + '-daily' }}",
+            "generated_at": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "report_type": "daily",
+            "period_start": "={{ $('Prepare ReportLog daily').first().json.periodStart }}",
+            "period_end": "={{ $('Prepare ReportLog daily').first().json.periodEnd }}",
+            "total_ils": "={{ $('Prepare ReportLog daily').first().json.total }}",
+            "delivery_status": "sent"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "report_id",
+              "displayName": "report_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "generated_at",
+              "displayName": "generated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "report_type",
+              "displayName": "report_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_start",
+              "displayName": "period_start",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_end",
+              "displayName": "period_end",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total_ils",
+              "displayName": "total_ils",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "delivery_status",
+              "displayName": "delivery_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "34c627ef-e712-4d62-865b-5001b5e9aedc",
+      "name": "ReportLog - daily Sent",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        528,
+        704
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "ReportLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "report_id": "={{ 'rpt-' + $execution.id + '-daily' }}",
+            "generated_at": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "report_type": "daily",
+            "period_start": "={{ $('Prepare ReportLog daily').first().json.periodStart }}",
+            "period_end": "={{ $('Prepare ReportLog daily').first().json.periodEnd }}",
+            "total_ils": "={{ $('Prepare ReportLog daily').first().json.total }}",
+            "delivery_status": "failed"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "report_id",
+              "displayName": "report_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "generated_at",
+              "displayName": "generated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "report_type",
+              "displayName": "report_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_start",
+              "displayName": "period_start",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "period_end",
+              "displayName": "period_end",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total_ils",
+              "displayName": "total_ils",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "delivery_status",
+              "displayName": "delivery_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "9db396fe-3912-4909-abd6-1072e1485b4d",
+      "name": "ReportLog - daily Failed",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        528,
+        896
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Settings",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "d6332a39-9990-4c04-b961-0f672c3083ca",
+      "name": "Read Settings for Weekly Report",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -1264,
+        1280
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(x => x.json);\nconst s = Object.fromEntries(rows.map(r => [String(r.key || '').trim(), r.value]));\nconst rawEnabled = String(s.weekly_report_enabled ?? 'true').trim().toLowerCase();\nconst enabled = !['false','0','no','off','disabled'].includes(rawEnabled);\nconst rawChat = String(s.telegram_chat_id || '').trim();\nconst chatId = (!rawChat || rawChat.includes('REPLACE_WITH')) ? String(s.authorized_telegram_user_id || '').trim() : rawChat;\nreturn [{json: {enabled, chatId, timezone: String(s.timezone || 'Asia/Gaza'), budget: Number(s.monthly_budget_ils || 300), currency: String(s.currency || 'ILS')}}];"
+      },
+      "id": "e3d529bf-d077-4f84-83ff-d6ac87623e32",
+      "name": "Prepare Weekly Settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1040,
+        1280
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "3b1db81b-51df-467b-9b4c-b18c2e802e92",
+              "leftValue": "={{ $json.enabled }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e34dcdec-b91f-46a6-9731-18b234b6b703",
+      "name": "Weekly Reports Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -816,
+        1280
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Settings",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "7acbec14-3dcc-4406-b35d-740cb2c41d7d",
+      "name": "Read Settings for Monthly Report",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -3184,
+        1648
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(x => x.json);\nconst s = Object.fromEntries(rows.map(r => [String(r.key || '').trim(), r.value]));\nconst rawEnabled = String(s.monthly_report_enabled ?? 'true').trim().toLowerCase();\nconst enabled = !['false','0','no','off','disabled'].includes(rawEnabled);\nconst rawChat = String(s.telegram_chat_id || '').trim();\nconst chatId = (!rawChat || rawChat.includes('REPLACE_WITH')) ? String(s.authorized_telegram_user_id || '').trim() : rawChat;\nreturn [{json: {enabled, chatId, timezone: String(s.timezone || 'Asia/Gaza'), budget: Number(s.monthly_budget_ils || 300), currency: String(s.currency || 'ILS')}}];"
+      },
+      "id": "b667c060-2c38-49e2-913e-d0611e3ffcd7",
+      "name": "Prepare Monthly Settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2960,
+        1648
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "1f166a9c-d8ac-4410-8465-6a51e7e13682",
+              "leftValue": "={{ $json.enabled }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5707d5b5-adb5-478d-9c19-f20ecf6563d9",
+      "name": "Monthly Reports Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2736,
+        1648
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "AuditLog",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_id": "={{ 'evt-reject-' + $execution.id + '-' + Date.now() }}",
+            "timestamp": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "user_id": "={{ $('Validate and Calculate').first().json.fromId }}",
+            "action": "expense_rejected",
+            "expense_id": "={{ $('Validate and Calculate').first().json.expense_id || '' }}",
+            "result": "failure",
+            "details": "={{ String($('Validate and Calculate').first().json.reply || 'Invalid or duplicate expense').slice(0,400) }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "event_id",
+              "displayName": "event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "user_id",
+              "displayName": "user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "action",
+              "displayName": "action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "expense_id",
+              "displayName": "expense_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "result",
+              "displayName": "result",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "details",
+              "displayName": "details",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "5920c905-c8bb-4647-88b2-d990eb138ba4",
+      "name": "AuditLog - Expense Rejected",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        80,
+        224
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst u = $json;\n\nconst msg = u.message || u.callback_query?.message || {};\nconst cb = u.callback_query || null;\n\nconst text = String(msg.text || '').trim();\nconst callback = String(cb?.data || '').trim();\n\nconst fromId = String(\n  (u.message?.from || cb?.from || {}).id || ''\n);\n\nconst chatId = String(msg.chat?.id || '');\n\nconst isSlashControl =\n  /^\\/(settings|menu|budget|currency|threshold|weekly|monthly|category_add|categoryadd|category_name|categoryname|category_keywords|categorykeywords|category_toggle|categorytoggle|categories|help)(?:@\\w+)?(?:\\s|$)/i.test(text);\n\nconst isNaturalCategoryAdd =\n  /^(?:حط|ضيف|أضف|اضف)\\s+تصنيف(?:\\s+جديد)?(?:\\s|$)/i.test(text);\n\nconst isNaturalCurrencyChange =\n  /^(?:عدل|عدّل|غيّر|غير|تغيير|اجعل|خلي|خلّي)\\s+العملة(?:\\s+(?:(?:الى|إلى)\\s+)?)/i.test(text);\n\nconst isNaturalThresholdChange =\n  /^(?:غيّر|غير|عدل|عدّل|تغيير)\\s+(?:حد|نسبة)\\s+التنبيه(?:\\s|$)/i.test(text);\n\nconst isNaturalBudgetChange =\n  /^(?:ارفع|رفع|زِد|زيد|نزل|نزّل|خفّض|خفض|قلل|قلّل|غيّر|غير|عدل|عدّل|تغيير)\\s+الميزانية(?:\\s|$)/i.test(text) ||\n  /^(?:خلّي|خلي|اجعل)\\s+(?:الميزانية|ميزانيتي)(?:\\s|$)/i.test(text);\n\nconst isControl =\n  Boolean(cb) ||\n  isSlashControl ||\n  isNaturalCategoryAdd ||\n  isNaturalCurrencyChange ||\n  isNaturalThresholdChange ||\n  isNaturalBudgetChange;\n\nreturn [\n  {\n    json: {\n      ...u,\n      _control: {\n        isControl,\n        text,\n        callback,\n        fromId,\n        chatId,\n        messageId: String(msg.message_id || ''),\n        callbackQueryId: String(cb?.id || '')\n      }\n    }\n  }\n];\n"
+      },
+      "id": "2de3b377-bdc4-473c-9c72-ba0bb659461a",
+      "name": "Control Router",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3184,
+        608
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "control-route",
+              "leftValue": "={{ $json._control.isControl }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0d52e020-1c6e-42ad-b60e-f8dbf6c2507f",
+      "name": "Is Settings Command?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2960,
+        608
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Settings",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "6723d445-5438-4b9f-a36e-222bfbbadff5",
+      "name": "Read Settings for Control",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -2736,
+        272
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Categories",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "ad27350d-9343-4b81-b1c4-f9440c2b87d7",
+      "name": "Read Categories for Control",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -2512,
+        272
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst ctl = $('Control Router').first().json._control;\n\nconst settings = Object.fromEntries(\n  $('Read Settings for Control').all().map(x => [\n    String(x.json.key || '').trim(),\n    String(x.json.value ?? '').trim()\n  ])\n);\n\nconst clean = v => String(v ?? '')\n  .replace(/[\\u200B-\\u200D\\uFEFF]/g, '')\n  .replace(/\\\\/g, '')\n  .trim();\n\nconst normalizeId = v => clean(v).toUpperCase();\n\nconst allCats = $('Read Categories for Control')\n  .all()\n  .map(x => x.json)\n  .filter(x => clean(x.category_id));\n\nconst cats = [\n  ...new Map(\n    allCats.map(c => [\n      normalizeId(c.category_id),\n      {\n        ...c,\n        category_id: normalizeId(c.category_id)\n      }\n    ])\n  ).values()\n];\n\nlet raw = clean(ctl.callback || ctl.text || '');\nconst cb = ctl.callback;\n\nlet op = 'help';\nlet key = '';\nlet value = '';\nlet description = '';\nlet category_id = '';\nlet category_name = '';\nlet keywords = '';\nlet enabled = 'TRUE';\nlet reply = '';\n\nconst configuredAuthorizedId = clean(\n  settings.authorized_telegram_user_id || ''\n);\n\nconst authorizedId =\n  (!configuredAuthorizedId ||\n   configuredAuthorizedId.includes('REPLACE_WITH'))\n    ? ''\n    : configuredAuthorizedId;\n\nif (!authorizedId || String(ctl.fromId || '').trim() !== authorizedId) {\n  return [{\n    json: {\n      ...ctl,\n      op: 'help',\n      reply: 'عذرًا، هذا البوت خاص بصاحبه وما عندك صلاحية تستخدمه.'\n    }\n  }];\n}\n\n// ================================\n// العملات العربية\n// ================================\n\nconst currencyMap = {\n  'دولار': 'USD',\n  'الدولار': 'USD',\n  'دولار امريكي': 'USD',\n  'الدولار امريكي': 'USD',\n  'دولار أمريكي': 'USD',\n  'الدولار الأمريكي': 'USD',\n  'usd': 'USD',\n\n  'شيكل': 'ILS',\n  'الشيكل': 'ILS',\n  'شيكل جديد': 'ILS',\n  'الشيكل الجديد': 'ILS',\n  'ils': 'ILS',\n\n  'دينار': 'JOD',\n  'الدينار': 'JOD',\n  'دينار اردني': 'JOD',\n  'دينار أردني': 'JOD',\n  'الدينار الأردني': 'JOD',\n  'jod': 'JOD',\n\n  'يورو': 'EUR',\n  'اليورو': 'EUR',\n  'eur': 'EUR'\n};\n\nfunction normalizeCurrency(input) {\n  const text = clean(input)\n    .replace(/[.!،,؛;]+$/g, '')\n    .trim();\n\n  return currencyMap[text] ||\n    currencyMap[text.toLowerCase()] ||\n    text.toUpperCase();\n}\n\n// ================================\n// تحويل اللغة الطبيعية إلى أوامر\n// ================================\n\nif (!cb) {\n  // تغيير العملة:\n  // اجعل العملة شيكل\n  // خلي العملة شيكل\n  // عدل العملة شيكل\n  // غير العملة إلى دولار\n  const currencyMatch = raw.match(\n    /^(?:عدل|عدّل|غيّر|غير|تغيير|اجعل|خلي|خلّي)\\s+العملة\\s*(?:(?:الى|إلى|لـ)\\s*)?(.+?)\\s*$/i\n  );\n\n  if (currencyMatch) {\n    const currencyText = clean(currencyMatch[1]);\n\n    if (!currencyText) {\n      raw = '/__invalid_natural_currency';\n    } else {\n      raw = '/currency ' + normalizeCurrency(currencyText);\n    }\n  }\n\n  // تغيير حد التنبيه\n  const thresholdMatch = raw.match(\n    /^(?:غيّر|غير|عدل|عدّل|تغيير)\\s+(?:حد|نسبة)\\s+التنبيه\\s*(?:(?:الى|إلى)\\s*)?(\\d+(?:\\.\\d+)?)\\s*%?\\s*$/i\n  );\n\n  if (thresholdMatch) {\n    raw = '/threshold ' + thresholdMatch[1];\n  } else if (\n    /^(?:غيّر|غير|عدل|عدّل|تغيير)\\s+(?:حد|نسبة)\\s+التنبيه(?:\\s|$)/i.test(raw)\n  ) {\n    raw = '/__invalid_natural_threshold';\n  }\n\n  // تغيير الميزانية\n  const budgetPatterns = [\n    /^(?:ارفع|رفع|زِد|زيد|نزل|نزّل|خفّض|خفض|قلل|قلّل|غيّر|غير|عدل|عدّل|تغيير)\\s+الميزانية\\s*(?:(?:الى|إلى)\\s*)?(\\d+(?:\\.\\d+)?)\\s*$/i,\n    /^(?:خلّي|خلي|اجعل)\\s+(?:الميزانية|ميزانيتي)\\s*(?:(?:الى|إلى)\\s*)?(\\d+(?:\\.\\d+)?)\\s*$/i\n  ];\n\n  let budgetMatch = null;\n\n  for (const pattern of budgetPatterns) {\n    budgetMatch = raw.match(pattern);\n    if (budgetMatch) break;\n  }\n\n  if (budgetMatch) {\n    raw = '/budget ' + budgetMatch[1];\n  } else if (\n    /^(?:ارفع|رفع|زِد|زيد|نزل|نزّل|خفّض|خفض|قلل|قلّل|غيّر|غير|عدل|عدّل|تغيير)\\s+الميزانية(?:\\s|$)/i.test(raw) ||\n    /^(?:خلّي|خلي|اجعل)\\s+(?:الميزانية|ميزانيتي)(?:\\s|$)/i.test(raw)\n  ) {\n    raw = '/__invalid_natural_budget';\n  }\n\n  // إضافة تصنيف باللغة الطبيعية\n  // مثال:\n  // ضيف تصنيف جديد اسمه مواصلات والكلمات المفتاحية لها تكسي، باص\n  // أو:\n  // ضيف تصنيف مواصلات | تكسي، باص\n  if (\n    /^(?:حط|ضيف|أضف|اضف)\\s+تصنيف(?:\\s+جديد)?(?:\\s|$)/i.test(raw)\n  ) {\n    const naturalText = clean(raw);\n\n    let parsedName = '';\n    let parsedKeywords = '';\n\n    if (naturalText.includes('|')) {\n      const parts = naturalText.split('|').map(clean);\n\n      if (parts.length >= 2) {\n        parsedName = parts[0]\n          .replace(\n            /^(?:حط|ضيف|أضف|اضف)\\s+تصنيف(?:\\s+جديد)?\\s*/i,\n            ''\n          )\n          .replace(/^(?:اسمه|اسمها|اسم)\\s*/i, '')\n          .trim();\n\n        parsedKeywords = parts.slice(1).join(' | ');\n      }\n    } else {\n    const nameMatch = naturalText.match(\n  /(?:اسمه|اسمها|اسم)\\s+(.+?)(?=\\s+(?:و?الكلمات\\s+المفتاحية|والكلمات|المفتاحية|كلمات(?:\\s+مفتاحية)?)|$)/i\n);\n\n     const kwMatch = naturalText.match(\n  /(?:الكلمات\\s+المفتاحية|كلمات\\s+مفتاحية|الكلمات|المفتاحية)\\s+(?:(?:لها|له|للتصنيف)\\s*)?(?:هي\\s*)?[:：=]?\\s*(.+)$/i\n);\n\n      if (nameMatch && kwMatch) {\n        parsedName = nameMatch[1];\n        parsedKeywords = kwMatch[1];\n      }\n    }\n\n    parsedName = clean(parsedName)\n      .replace(/[،,;؛|]+$/, '')\n      .trim();\n\n    parsedKeywords = clean(parsedKeywords)\n      .replace(/^[\\s:：=]+/, '')\n      .replace(/[\\\\]+$/g, '')\n      .trim();\n\n    if (parsedName && parsedKeywords) {\n      raw = '/category_add ' +\n        parsedName + ' | ' + parsedKeywords;\n    } else {\n      raw = '/__invalid_natural_category';\n    }\n  }\n\n  // تعديل اسم تصنيف\n  // غير اسم التصنيف C11 إلى مواصلات\n  const nameChange = raw.match(\n    /^(?:غير|غيّر|عدل|عدّل)\\s+اسم\\s+التصنيف\\s+(C\\d+)\\s+(?:الى|إلى)\\s+(.+)$/i\n  );\n\n  if (nameChange) {\n    raw = '/category_name ' +\n      nameChange[1] + ' | ' + clean(nameChange[2]);\n  }\n\n  // تعديل الكلمات المفتاحية\n  // عدل كلمات التصنيف C11 إلى تكسي، باص\n  const keywordsChange = raw.match(\n    /^(?:غير|غيّر|عدل|عدّل)\\s+(?:كلمات|الكلمات)\\s+(?:المفتاحية\\s+)?(?:للتصنيف\\s+)?(C\\d+)\\s+(?:الى|إلى)\\s+(.+)$/i\n  );\n\n  if (keywordsChange) {\n    raw = '/category_keywords ' +\n      keywordsChange[1] + ' | ' + clean(keywordsChange[2]);\n  }\n\n  // تفعيل أو تعطيل تصنيف\n  const categoryToggle = raw.match(\n    /^(?:فعّل|فعل|تفعيل|شغّل|شغل|عطّل|عطل|تعطيل)\\s+(?:التصنيف\\s+)?(C\\d+)\\s*$/i\n  );\n\n  if (categoryToggle) {\n    const action = clean(raw).split(/\\s+/)[0];\n\n    const turnOn = [\n      'فعّل', 'فعل', 'تفعيل', 'شغّل', 'شغل'\n    ].includes(action);\n\n    raw = '/category_toggle ' +\n      categoryToggle[1] + (turnOn ? ' on' : ' off');\n  }\n}\n\n// ================================\n// رد قائمة التصنيفات\n// ================================\n\nfunction categoriesReply() {\n  const isActive = c =>\n    ![\n      'false', '0', 'no', 'off', 'معطل', 'معطّل'\n    ].includes(clean(c.enabled ?? 'TRUE').toLowerCase());\n\n  const lines = [\n    '🏷️ تصنيفات مصروفي',\n    '📊 العدد: ' + cats.length,\n    ''\n  ];\n\n  for (const c of cats) {\n    lines.push(\n      (isActive(c) ? '🟢 ' : '⚪ ') +\n      c.category_id + ' — ' +\n      clean(c.category_name || 'بدون اسم') +\n      (isActive(c) ? ' (مفعّل)' : ' (معطّل)')\n    );\n  }\n\n  return lines.join('\\n');\n}\n\nfunction parseKeywords(text) {\n  return clean(text)\n    .replace(/\\s*[,،;؛]\\s*/g, ', ')\n    .trim();\n}\n\nfunction helpReply() {\n  return [\n    '⚙️ إعدادات مصروفي',\n    '',\n    '💰 الميزانية: ' +\n      (settings.monthly_budget_ils || '300'),\n    '💱 العملة: ' +\n      (settings.currency || 'ILS'),\n    '🔔 نسبة التنبيه: ' +\n      (settings.budget_alert_threshold_percent || '100') + '%',\n    '📅 التقرير الأسبوعي: ' +\n      (settings.weekly_report_enabled || 'true'),\n    '🗓️ التقرير الشهري: ' +\n      (settings.monthly_report_enabled || 'true'),\n    '',\n    '💰 الميزانية:',\n    '/budget 500',\n    'ارفع الميزانية إلى 600',\n    'خلي الميزانية 400',\n    'نزل الميزانية إلى 300',\n    '',\n    '💱 العملة:',\n    '/currency ILS',\n    'اجعل العملة شيكل',\n    'خلي العملة دولار',\n    'عدل العملة دينار',\n    '',\n    '🔔 التنبيه والتقارير:',\n    '/threshold 80',\n    '/weekly on',\n    '/weekly off',\n    '/monthly on',\n    '/monthly off',\n    '',\n    '🏷️ التصنيفات:',\n    '/categories',\n    '/category_add مواصلات | تكسي، باص',\n    '/category_name C11 | الاسم الجديد',\n    '/category_keywords C11 | كلمة1، كلمة2',\n    '/category_toggle C11 off',\n    '',\n    'أمثلة باللغة الطبيعية:',\n     'حط تصنيف جديد اسمه مواصلات والكلمات المفتاحية لها تكسي، باص',\n    'ضيف تصنيف جديد اسمه مواصلات والكلمات المفتاحية لها تكسي، باص',\n    'غير اسم التصنيف C11 إلى مواصلات',\n    'عدل كلمات التصنيف C11 إلى تكسي، باص',\n    'عطّل التصنيف C11',\n    'فعّل التصنيف C11'\n  ].join('\\n');\n}\n\n// ================================\n// تحليل الأوامر\n// ================================\n\nif (cb) {\n  const act = cb.replace(/^control:/, '');\n\n  if (act === 'menu' || act === 'settings') {\n    op = 'menu';\n    reply = helpReply();\n\n  } else if (act === 'categories') {\n    op = 'categories';\n    reply = categoriesReply();\n\n  } else {\n    op = 'help';\n\n    const instructions = {\n      budget: 'لتغيير الميزانية أرسل: /budget 500',\n      currency: 'لتغيير العملة أرسل: /currency ILS',\n      threshold: 'لتغيير نسبة التنبيه أرسل: /threshold 80',\n      weekly: 'استخدم /weekly on أو /weekly off',\n      monthly: 'استخدم /monthly on أو /monthly off'\n    };\n\n    reply = instructions[act] ||\n      'أرسل الأمر مع القيمة المطلوبة.';\n  }\n\n} else {\n  const m = raw.match(\n    /^\\/(settings|menu|help|budget|currency|threshold|weekly|monthly|category_add|categoryadd|category_name|categoryname|category_keywords|categorykeywords|category_toggle|categorytoggle|categories)(?:@\\w+)?(?:\\s+(.*))?$/i\n  );\n\n  let command = (m?.[1] || '').toLowerCase();\n  const arg = (m?.[2] || '').trim();\n\n  const aliases = {\n    categoryadd: 'category_add',\n    categoryname: 'category_name',\n    categorykeywords: 'category_keywords',\n    categorytoggle: 'category_toggle'\n  };\n\n  command = aliases[command] || command;\n\n  if (raw === '/__invalid_natural_budget') {\n    reply =\n      '⚠️ لم أفهم مبلغ الميزانية.\\n' +\n      'مثال: ارفع الميزانية إلى 600';\n\n  } else if (raw === '/__invalid_natural_currency') {\n    reply =\n      '⚠️ حدد العملة التي تريدها.\\n' +\n      'مثال: اجعل العملة شيكل';\n\n  } else if (raw === '/__invalid_natural_threshold') {\n    reply =\n      '⚠️ حدد نسبة التنبيه.\\n' +\n      'مثال: غير حد التنبيه إلى 20';\n\n  } else if (raw === '/__invalid_natural_category') {\n    reply =\n      '⚠️ لم أستطع فهم إضافة التصنيف.\\n\\n' +\n      'استخدم مثلًا:\\n' +\n      'ضيف تصنيف جديد اسمه مواصلات والكلمات المفتاحية لها تكسي، باص\\n\\n' +\n      'أو:\\n' +\n      '/category_add مواصلات | تكسي، باص';\n\n  } else if (['settings', 'menu', 'help', ''].includes(command)) {\n    op = 'menu';\n    reply = helpReply();\n\n  } else if (command === 'budget') {\n    const n = Number(arg);\n\n    if (!Number.isFinite(n) || n <= 0) {\n      reply = 'اكتب ميزانية صحيحة. مثال: /budget 500';\n    } else {\n      op = 'setting';\n      key = 'monthly_budget_ils';\n      value = String(n);\n      description = 'Monthly budget in selected currency';\n\n      reply =\n        '✅ تم تغيير الميزانية إلى ' +\n        n + ' ' + (settings.currency || 'ILS');\n    }\n\n  } else if (command === 'currency') {\n    const v = normalizeCurrency(arg);\n\n    if (!/^[A-Z]{3}$/.test(v)) {\n      reply =\n        '⚠️ اكتب اسم العملة أو رمزها.\\n' +\n        'أمثلة: شيكل، دولار، دينار، يورو\\n' +\n        '/currency ILS';\n    } else {\n      op = 'setting';\n      key = 'currency';\n      value = v;\n      description = 'Currency code';\n\n      const currencyNames = {\n        ILS: 'الشيكل',\n        USD: 'الدولار',\n        JOD: 'الدينار الأردني',\n        EUR: 'اليورو'\n      };\n\n      reply =\n        '✅ تم تغيير العملة إلى ' +\n        (currencyNames[v] || v) +\n        ' (' + v + ').';\n    }\n\n  } else if (command === 'threshold') {\n    const n = Number(arg);\n\n    if (!Number.isFinite(n) || n < 1 || n > 1000) {\n      reply = 'النسبة لازم تكون بين 1 و1000. مثال: /threshold 80';\n    } else {\n      op = 'setting';\n      key = 'budget_alert_threshold_percent';\n      value = String(n);\n      description = 'Budget alert threshold percent';\n\n      reply = '✅ تم تغيير نسبة التنبيه إلى ' + n + '%';\n    }\n\n  } else if (command === 'weekly' || command === 'monthly') {\n    const v = arg.toLowerCase();\n\n    if (\n      ![\n        'on', 'off', 'true', 'false',\n        'تشغيل', 'إيقاف', 'تفعيل', 'تعطيل'\n      ].includes(v)\n    ) {\n      reply = 'استخدم: /' + command + ' on أو /' + command + ' off';\n    } else {\n      op = 'setting';\n\n      key = command === 'weekly'\n        ? 'weekly_report_enabled'\n        : 'monthly_report_enabled';\n\n      value = [\n        'on', 'true', 'تشغيل', 'تفعيل'\n      ].includes(v) ? 'true' : 'false';\n\n      description = command === 'weekly'\n        ? 'Enable weekly report'\n        : 'Enable monthly report';\n\n      reply =\n        '✅ ' +\n        (command === 'weekly'\n          ? 'التقرير الأسبوعي'\n          : 'التقرير الشهري') +\n        ' ' +\n        (value === 'true' ? 'مفعّل' : 'متوقف');\n    }\n\n  } else if (command === 'category_add') {\n    const parts = arg.split('|').map(clean);\n\n    if (parts.length < 2 || !parts[0] || !parts[1]) {\n      reply =\n        'استخدم:\\n' +\n        '/category_add اسم التصنيف | كلمة1، كلمة2';\n\n    } else if (\n      cats.some(c =>\n        clean(c.category_name).toLowerCase() ===\n        parts[0].toLowerCase()\n      )\n    ) {\n      reply = '⚠️ هذا التصنيف موجود مسبقًا.';\n\n    } else {\n      let max = 0;\n\n      for (const c of cats) {\n        const mm = normalizeId(c.category_id).match(/^C(\\d+)$/);\n\n        if (mm) {\n          max = Math.max(max, Number(mm[1]));\n        }\n      }\n\n      category_id = 'C' + String(max + 1).padStart(2, '0');\n      category_name = parts[0];\n      keywords = parseKeywords(parts.slice(1).join(' | '));\n      enabled = 'TRUE';\n      op = 'category_add';\n\n      reply =\n        '✅ تم طلب إضافة التصنيف ' +\n        category_name + ' (' + category_id + ')';\n    }\n\n  } else if (\n    [\n      'category_name',\n      'category_keywords',\n      'category_toggle'\n    ].includes(command)\n  ) {\n    const parts = arg.split('|').map(clean);\n\n    if (command === 'category_toggle') {\n      const tokens = clean(arg).split(/\\s+/);\n      category_id = normalizeId(tokens[0]);\n      value = clean(tokens.slice(1).join(' ')).toLowerCase();\n    } else {\n      category_id = normalizeId(parts[0]);\n    }\n\n    const cat = cats.find(\n      c => normalizeId(c.category_id) === category_id\n    );\n\n    if (!cat) {\n      reply =\n        '❌ لم أجد التصنيف ' + category_id +\n        '. استخدم /categories لعرض القائمة.';\n\n    } else if (command === 'category_name') {\n      if (!parts[1]) {\n        reply = 'استخدم: /category_name C11 | الاسم الجديد';\n      } else {\n        category_name = parts.slice(1).join(' | ');\n        keywords = clean(cat.keywords || '');\n        enabled = String(cat.enabled ?? 'TRUE');\n        op = 'category_update';\n\n        reply =\n          '✅ تم طلب تغيير اسم ' + category_id +\n          ' إلى ' + category_name;\n      }\n\n    } else if (command === 'category_keywords') {\n      if (!parts[1]) {\n        reply = 'استخدم: /category_keywords C11 | كلمة1، كلمة2';\n      } else {\n        category_name = clean(cat.category_name || '');\n        keywords = parseKeywords(parts.slice(1).join(' | '));\n        enabled = String(cat.enabled ?? 'TRUE');\n        op = 'category_update';\n\n        reply = '✅ تم طلب تحديث كلمات التصنيف ' + category_id;\n      }\n\n    } else {\n      const v = value;\n\n      if (\n        !['on', 'off', 'true', 'false', 'تفعيل', 'تعطيل'].includes(v)\n      ) {\n        reply =\n          'استخدم: /category_toggle C11 on أو /category_toggle C11 off';\n      } else {\n        category_name = clean(cat.category_name || '');\n        keywords = clean(cat.keywords || '');\n\n        enabled = ['on', 'true', 'تفعيل'].includes(v)\n          ? 'TRUE'\n          : 'FALSE';\n\n        op = 'category_update';\n\n        reply =\n          '✅ التصنيف ' + category_name + ' ' +\n          (enabled === 'TRUE' ? 'مفعّل' : 'معطّل');\n      }\n    }\n\n  } else if (command === 'categories') {\n    op = 'categories';\n    reply = categoriesReply();\n\n  } else {\n    reply =\n      '❓ الأمر غير معروف.\\n' +\n      'أرسل /settings لعرض الأوامر والأمثلة.';\n  }\n}\n\nreturn [{\n  json: {\n    ...ctl,\n    op,\n    key,\n    value,\n    description,\n    category_id,\n    category_name,\n    keywords,\n    enabled,\n    reply,\n    updated_at: new Date().toISOString()\n  }\n}];\n"
+      },
+      "id": "03ce1a41-330f-4985-81d7-884bc4c59f52",
+      "name": "Parse Control Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2288,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.op }}",
+                    "rightValue": "setting",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "c0f04878-77f8-47af-9f77-fc96a3b55335"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "setting"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.op }}",
+                    "rightValue": "category_add",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "dde98e11-56c9-43b3-8335-d8411f704eb7"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "category_add"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.op }}",
+                    "rightValue": "category_update",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "81b4deb9-a6e9-462c-94cc-9c37078b087c"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "category_update"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "03ce338e-22c5-478d-900a-4bdf31d38298",
+      "name": "Route Control Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        -2000,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Settings",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "key": "={{ $json.key }}",
+            "value": "={{ $json.value }}",
+            "description": "={{ $json.description }}",
+            "updated_at": "={{ $json.updated_at }}"
+          },
+          "matchingColumns": [
+            "key"
+          ],
+          "schema": [
+            {
+              "id": "key",
+              "displayName": "key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "value",
+              "displayName": "value",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "removed": false
+            },
+            {
+              "id": "description",
+              "displayName": "description",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "removed": false
+            },
+            {
+              "id": "updated_at",
+              "displayName": "updated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "removed": false
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3f0dc1f2-b321-4ce6-ac10-ff440cbcbab3",
+      "name": "Update Setting in Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -1712,
+        -80
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Categories",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "category_id": "={{ $json.category_id }}",
+            "category_name": "={{ $json.category_name }}",
+            "keywords": "={{ $json.keywords }}",
+            "enabled": "={{ $json.enabled }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "category_id",
+              "displayName": "category_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "category_name",
+              "displayName": "category_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "removed": false
+            },
+            {
+              "id": "keywords",
+              "displayName": "keywords",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "removed": false
+            },
+            {
+              "id": "enabled",
+              "displayName": "enabled",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "removed": false
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "655dff58-fcf8-4a70-9bd4-2fe0a6373693",
+      "name": "Add Category to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -1712,
+        112
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Categories",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "category_id": "={{ $json.category_id }}",
+            "category_name": "={{ $json.category_name }}",
+            "keywords": "={{ $json.keywords }}",
+            "enabled": "={{ $json.enabled }}"
+          },
+          "matchingColumns": [
+            "category_id"
+          ],
+          "schema": [
+            {
+              "id": "category_id",
+              "displayName": "category_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "category_name",
+              "displayName": "category_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "removed": false
+            },
+            {
+              "id": "keywords",
+              "displayName": "keywords",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "removed": false
+            },
+            {
+              "id": "enabled",
+              "displayName": "enabled",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false,
+              "removed": false
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "637f9ee7-8a38-4dc7-bdcb-c5417fcb052f",
+      "name": "Update Category in Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -1712,
+        304
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Control Router').first().json._control.chatId }}",
+        "text": "={{ $('Parse Control Command').first().json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "5ddc5ea3-12ad-458c-9a43-9d6a4010aaff",
+      "name": "Reply - Setting Updated",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1488,
+        -80
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Control Router').first().json._control.chatId }}",
+        "text": "={{ $('Parse Control Command').first().json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "4a466947-0f68-4671-85b3-9624c0e2bad2",
+      "name": "Reply - Category Added",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1488,
+        112
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Control Router').first().json._control.chatId }}",
+        "text": "={{ $('Parse Control Command').first().json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "fa21135d-61b3-4a40-b184-276477963b14",
+      "name": "Reply - Category Updated",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1488,
+        304
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Control Router').first().json._control.chatId }}",
+        "text": "={{ $('Parse Control Command').first().json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "4bb44b6e-42b2-4fce-a178-c406711218e6",
+      "name": "Reply - Control Help or Listing",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1712,
+        496
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = Object.fromEntries($input.all().map(x => [String(x.json.key || '').trim(), x.json.value]));\nconst configured = String(s.authorized_telegram_user_id || '').trim();\nconst ctl = $('Control Router').first().json._control;\nconst fromId = String(ctl.fromId || '').trim();\nconst allowed = fromId !== '' && configured !== '' && !configured.includes('REPLACE_WITH') && fromId === configured;\nreturn [{ json: { allowed, fromId, chatId: String(ctl.chatId || '') }, pairedItem: { item: 0 } }];"
+      },
+      "id": "4ab165ce-6d66-4a04-be8d-3e335cd2090d",
+      "name": "Pre-AI Auth Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2512,
+        1056
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "preauth1",
+              "leftValue": "={{ $json.allowed }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": "true"
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          }
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "2901faa0-84a5-4c6f-a41a-554fbfe4cbfb",
+      "name": "Pre-AI Authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2288,
+        1056
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Control Router').first().json._control.chatId }}",
+        "text": "عذرًا، هذا البوت خاص بصاحبه وما عندك صلاحية تستخدمه.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "9b9a214f-358e-43cd-ad45-2f5a2b2b580e",
+      "name": "Reject Unauthorized (Pre-AI)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -2000,
+        1056
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "AuditLog",
+          "mode": "name"
+        },
+        "columns": {
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false,
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "schema": [
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "event_id",
+              "id": "event_id",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "timestamp",
+              "id": "timestamp",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "user_id",
+              "id": "user_id",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "action",
+              "id": "action",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "expense_id",
+              "id": "expense_id",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "result",
+              "id": "result",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "details",
+              "id": "details",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            }
+          ],
+          "value": {
+            "action": "authorization_rejected",
+            "details": "Unauthorized Telegram user message rejected before AI parsing",
+            "event_id": "={{ 'evt-auth-' + $execution.id }}",
+            "expense_id": "",
+            "result": "failure",
+            "timestamp": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "user_id": "={{ $('Control Router').first().json._control.fromId }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "67f0d5ff-d306-4f5b-ae89-15c4ac55f662",
+      "name": "AuditLog - Unauthorized (Pre-AI)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -2000,
+        1248
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "id": "a84389c9-abfb-4a99-ac4f-f6b70a13eda1",
+      "name": "Is Undo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2736,
+        2000
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "undo1",
+              "leftValue": "={{ /^(?:\\/undo(?:@\\w+)?|تراجع|رجوع|الغاء|إلغاء|الغي|ألغي|تراجع عن (?:آخر|اخر) (?:مصروف|تسجيل|عملية)|الغاء (?:آخر|اخر) (?:مصروف|تسجيل|عملية))\\s*[.!؟?]*$/i.test(String($('Control Router').first().json._control.text || '').trim()) }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": "true"
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          }
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "b2359e1e-c18c-481a-87bf-63114bdfdc23",
+      "name": "Read Expenses for Undo",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -2512,
+        2000
+      ],
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "options": {},
+        "sheetName": {
+          "__rl": true,
+          "value": "Expenses",
+          "mode": "name"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "id": "1f9db0e2-fefd-440d-ae5c-e9aab500504f",
+      "name": "Build Undo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2288,
+        2000
+      ],
+      "parameters": {
+        "jsCode": "const ctl = $('Control Router').first().json._control;\nconst uid = String(ctl.fromId || '');\nconst settings = Object.fromEntries($('Read Settings').all().map(x => [String(x.json.key || '').trim(), x.json.value]));\nconst cur = String(settings.currency || 'ILS');\nconst budget = Number(settings.monthly_budget_ils || 300);\nconst rows = $input.all().map(x => x.json).filter(r => String(r.expense_id || '').trim());\nconst isActive = r => String(r.status || 'active').trim() === 'active';\nconst mine = rows.filter(r => isActive(r) && (!String(r.user_id || '').trim() || String(r.user_id).trim() === uid));\nif (!mine.length) return [{ json: { hasUndo: false, reply: 'ما في مصروف مسجّل أقدر أتراجع عنه.' } }];\nconst ts = r => Date.parse(r.created_at || '') || 0;\nlet last = mine[0];\nfor (const r of mine) { if (ts(r) >= ts(last)) last = r; }\nconst mid = String(last.telegram_message_id || '').trim();\nconst batch = mid ? mine.filter(r => String(r.telegram_message_id || '').trim() === mid) : [last];\nconst ids = new Set(batch.map(r => r.expense_id));\nconst amt = r => Number(r.amount_ils || r.amount || 0);\nconst undone = batch.reduce((s, r) => s + amt(r), 0);\nconst mk = String(last.month_key || '').slice(0, 7);\nconst monthTotal = rows.filter(r => isActive(r) && !ids.has(r.expense_id) && String(r.month_key || '').slice(0, 7) === mk).reduce((s, r) => s + amt(r), 0);\nconst remaining = budget - monthTotal;\nconst reply = [\n  '↩️ تم التراجع عن آخر تسجيل',\n  ...batch.map(r => `🗑️ ${r.item}: ${amt(r)} ${cur}`),\n  `💵 المجموع الملغي: ${undone} ${cur}`,\n  `📊 مصاريف الشهر الآن: ${monthTotal} ${cur}`,\n  remaining >= 0 ? `🟢 ضايلك: ${remaining} ${cur}` : `🔴 متجاوز الميزانية بـ ${Math.abs(remaining)} ${cur}`\n].join('\\n');\nconst updated_at = new Date().toISOString();\nreturn batch.map(r => ({ json: { hasUndo: true, expense_id: r.expense_id, updated_at, reply } }));"
+      }
+    },
+    {
+      "id": "9fd881e2-dfa8-4a50-8e1b-00d800a340d4",
+      "name": "Anything to Undo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2064,
+        2000
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "undo2",
+              "leftValue": "={{ $json.hasUndo }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": "true"
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          }
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "fcca9ef6-ffe0-4ce6-a480-0c19741f9d4a",
+      "name": "Reverse Expense",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -1840,
+        1952
+      ],
+      "parameters": {
+        "columns": {
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false,
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "expense_id"
+          ],
+          "schema": [
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "expense_id",
+              "id": "expense_id",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "status",
+              "id": "status",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "updated_at",
+              "id": "updated_at",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "notes",
+              "id": "notes",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            }
+          ],
+          "value": {
+            "expense_id": "={{ $json.expense_id }}",
+            "notes": "undone by user",
+            "status": "reversed",
+            "updated_at": "={{ $json.updated_at }}"
+          }
+        },
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "operation": "update",
+        "options": {},
+        "sheetName": {
+          "__rl": true,
+          "value": "Expenses",
+          "mode": "name"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "id": "fc3501be-d207-4345-840c-65bf3dabe8c6",
+      "name": "Reply Undo",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1616,
+        1904
+      ],
+      "parameters": {
+        "additionalFields": {
+          "appendAttribution": false
+        },
+        "chatId": "={{ $('Control Router').first().json._control.chatId }}",
+        "text": "={{ $('Build Undo').first().json.reply }}"
+      },
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "id": "dc95442a-b750-4609-a222-e462532afc88",
+      "name": "AuditLog - Expense Undone",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -1616,
+        2048
+      ],
+      "parameters": {
+        "columns": {
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false,
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "schema": [
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "event_id",
+              "id": "event_id",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "timestamp",
+              "id": "timestamp",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "user_id",
+              "id": "user_id",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "action",
+              "id": "action",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "expense_id",
+              "id": "expense_id",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "result",
+              "id": "result",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "details",
+              "id": "details",
+              "removed": false,
+              "required": false,
+              "type": "string"
+            }
+          ],
+          "value": {
+            "action": "expense_undo",
+            "details": "={{ 'Undone ' + $('Build Undo').all().length + ' expense(s)' }}",
+            "event_id": "={{ 'evt-undo-' + $execution.id }}",
+            "expense_id": "={{ $('Build Undo').all().map(x => x.json.expense_id).join(',') }}",
+            "result": "success",
+            "timestamp": "={{ $now.setZone(\"Asia/Gaza\").toISO() }}",
+            "user_id": "={{ $('Control Router').first().json._control.fromId }}"
+          }
+        },
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "operation": "append",
+        "options": {},
+        "sheetName": {
+          "__rl": true,
+          "value": "AuditLog",
+          "mode": "name"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "id": "1da7af7e-e215-4cb8-8f6a-df34081ab2e1",
+      "name": "Reply Undo Failed",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1616,
+        2192
+      ],
+      "parameters": {
+        "additionalFields": {
+          "appendAttribution": false
+        },
+        "chatId": "={{ $('Control Router').first().json._control.chatId }}",
+        "text": "تعذّر التراجع عن التسجيل بسبب خطأ بـ Google Sheets. لم أؤكد التراجع؛ جرّب مرة ثانية بعد قليل."
+      },
+      "executeOnce": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "id": "d6844153-1f8d-4c5f-a64d-e860e85a488b",
+      "name": "Reply Nothing To Undo",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1840,
+        2192
+      ],
+      "parameters": {
+        "additionalFields": {
+          "appendAttribution": false
+        },
+        "chatId": "={{ $('Control Router').first().json._control.chatId }}",
+        "text": "={{ $json.reply }}"
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "id": "84bde278-bea7-45ab-9a6b-cf7add985df7",
+      "name": "Is Insights?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2512,
+        2400
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "ins1",
+              "leftValue": "={{ /(وين\\s+(بتروح|بروح|راحت|رايحة|بتروحوا)\\s*(ال)?(مصاري|مصاريف|فلوس|مصروف)?)|(وين\\s+(ال)?(مصاري|مصاريف|فلوس)\\S*\\s*(بتروح|راحت|رايحة))|((اكثر|أكثر)\\s+(شي|شيء|حاجة|غرض|فئة|تصنيف)?\\s*(بصرف|بصرفه|بنصرف))|^(تحليل|ملخص)\\s*(المصاريف|الصرف)?\\s*$/.test(String($('Control Router').first().json._control.text || '').trim()) }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": "true"
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          }
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "94f1f88d-5ced-4d37-99c0-838bb192740c",
+      "name": "Read Expenses for Insights",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -2288,
+        2400
+      ],
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "options": {},
+        "sheetName": {
+          "__rl": true,
+          "value": "Expenses",
+          "mode": "name"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "id": "b3578899-686f-419e-a567-2367a9edc083",
+      "name": "Build Insights",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2064,
+        2400
+      ],
+      "parameters": {
+        "jsCode": "const ctl = $('Control Router').first().json._control;\nconst text = String(ctl.text || '');\nconst settings = Object.fromEntries($('Read Settings').all().map(x => [String(x.json.key || '').trim(), x.json.value]));\nconst cur = String(settings.currency || 'ILS');\nconst budget = Number(settings.monthly_budget_ils || 300);\nconst tz = String(settings.timezone || 'Asia/Gaza');\nconst today = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());\nlet mode = 'month';\nif (/اليوم/.test(text)) mode = 'day';\nelse if (/(الاسبوع|الأسبوع|اسبوع|أسبوع)/.test(text)) mode = 'week';\nconst label = mode === 'day' ? 'اليوم' : (mode === 'week' ? 'آخر 7 أيام' : 'هالشهر');\nconst dayMs = 24 * 60 * 60 * 1000;\nconst startWeek = new Date(new Date(today + 'T00:00:00Z').getTime() - 6 * dayMs).toISOString().slice(0, 10);\nconst rows = $input.all().map(x => x.json).filter(r => String(r.expense_id || '').trim() && String(r.status || 'active').trim() === 'active');\nconst inRange = r => {\n  const d = String(r.expense_date || '').slice(0, 10);\n  if (mode === 'day') return d === today;\n  if (mode === 'week') return d >= startWeek && d <= today;\n  return String(r.month_key || r.expense_date || '').slice(0, 7) === today.slice(0, 7);\n};\nconst act = rows.filter(inRange);\nif (!act.length) return [{ json: { reply: `ما في مصاريف مسجّلة ${label} لسا.` } }];\nconst amt = r => Number(r.amount_ils || r.amount || 0);\nconst total = act.reduce((s, r) => s + amt(r), 0);\nconst fmtN = v => Number.isInteger(v) ? String(v) : v.toFixed(2);\nconst cats = {};\nconst items = {};\nfor (const r of act) {\n  const c = String(r.category || 'أخرى').trim();\n  cats[c] = (cats[c] || 0) + amt(r);\n  const it = String(r.item || '').trim();\n  if (it) { items[it] = items[it] || { sum: 0, n: 0 }; items[it].sum += amt(r); items[it].n += 1; }\n}\nconst catList = Object.entries(cats).sort((a, b) => b[1] - a[1]);\nconst itemList = Object.entries(items).sort((a, b) => b[1].sum - a[1].sum).slice(0, 5);\nconst lines = [`📈 وين بتروح مصاريفك ${label}`, `💸 المجموع: ${fmtN(total)} ${cur} (${act.length} مصروف)`, '', '📂 حسب الفئة:'];\nfor (const [c, v] of catList.slice(0, 6)) {\n  const pct = Math.round(v / total * 100);\n  lines.push(`${'█'.repeat(Math.max(1, Math.round(pct / 10)))} ${c}: ${fmtN(v)} ${cur} (${pct}%)`);\n}\nlines.push('', '🛍️ أكثر أغراض بتصرف عليها:');\nitemList.forEach(([it, o], i) => lines.push(`${i + 1}. ${it}: ${fmtN(o.sum)} ${cur}${o.n > 1 ? ' (' + o.n + ' مرات)' : ''}`));\nif (mode === 'month') {\n  const dayNum = Number(today.slice(8, 10)) || 1;\n  const y = Number(today.slice(0, 4)); const m = Number(today.slice(5, 7));\n  const dim = new Date(Date.UTC(y, m, 0)).getUTCDate();\n  const avg = total / dayNum;\n  const proj = avg * dim;\n  lines.push('', `📊 استخدمت ${Math.round(total / budget * 100)}% من ميزانيتك (${fmtN(budget)} ${cur})`);\n  lines.push(`📅 معدّلك اليومي: ${fmtN(Math.round(avg * 100) / 100)} ${cur}`);\n  lines.push(proj > budget ? `⚠️ بهالمعدّل رح توصل نهاية الشهر لحوالي ${fmtN(Math.round(proj))} ${cur} — أعلى من الميزانية` : `🟢 بهالمعدّل رح توصل نهاية الشهر لحوالي ${fmtN(Math.round(proj))} ${cur} — ضمن الميزانية`);\n}\nlines.push('', `💡 أكثر شي بتصرف عليه: ${catList[0][0]} (${Math.round(catList[0][1] / total * 100)}%)`);\nreturn [{ json: { reply: lines.join('\\n') } }];"
+      }
+    },
+    {
+      "id": "b107d3ca-d152-4ff6-9ad8-89adb45fac4d",
+      "name": "Reply Insights",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1840,
+        2400
+      ],
+      "parameters": {
+        "additionalFields": {
+          "appendAttribution": false
+        },
+        "chatId": "={{ $('Control Router').first().json._control.chatId }}",
+        "text": "={{ $json.reply }}"
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "id": "e1f6b8a1-4af9-4757-a396-2d92e9562591",
+      "name": "Has Text?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2512,
+        2800
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "hastext1",
+              "leftValue": "={{ String($('Control Router').first().json._control.text || '').trim().length > 0 }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": "true"
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          }
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "6123dd66-d592-4251-a394-4c4288f9320b",
+      "name": "Reply Text Only",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -2288,
+        2896
+      ],
+      "parameters": {
+        "additionalFields": {
+          "appendAttribution": false
+        },
+        "chatId": "={{ $('Control Router').first().json._control.chatId }}",
+        "text": "أرسل رسالة نصية فقط، مثلًا: قهوة ب 5. الصور والملصقات والرسائل الصوتية غير مدعومة حاليًا."
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    },
+    {
+      "id": "7991f469-4ae6-4d3c-9170-9265753accf0",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -3408,
+        2800
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "062b4247-7d05-48a6-af76-bf0fb770a493",
+      "name": "Notify Error",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -3184,
+        2800
+      ],
+      "parameters": {
+        "additionalFields": {
+          "appendAttribution": false
+        },
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ '⚠️ مصروفي: صار خطأ بالتنفيذ\\nالعقدة: ' + ($json.execution?.lastNodeExecuted || 'غير معروفة') + '\\nالسبب: ' + String($json.execution?.error?.message || 'غير معروف').slice(0, 300) + '\\nرقم التنفيذ: ' + ($json.execution?.id || '') + '\\n↻ إذا كانت رسالتك لم تنتسجّل، ابعتها مرة ثانية.' }}"
+      },
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "Telegram Bot (Masrofi)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Control Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Message": {
+      "main": [
+        [
+          {
+            "node": "Authorized User?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Authorized User?": {
+      "main": [
+        [
+          {
+            "node": "Report Request?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject Unauthorized",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AuditLog - Unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expense Message?": {
+      "main": [
+        [
+          {
+            "node": "Read Expenses",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply Clarification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Expenses": {
+      "main": [
+        [
+          {
+            "node": "Validate and Calculate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate and Calculate": {
+      "main": [
+        [
+          {
+            "node": "Valid New Expense?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid New Expense?": {
+      "main": [
+        [
+          {
+            "node": "Append Expense",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply Clarification",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AuditLog - Expense Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append Expense": {
+      "main": [
+        [
+          {
+            "node": "Build Single Reply",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AuditLog - Expense Saved",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AuditLog - Expense Save Failed",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Reply - Expense Save Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent - Understand Palestinian Arabic",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Single Reply": {
+      "main": [
+        [
+          {
+            "node": "Reply After Save",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Budget Alert Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Budget Alert Gate": {
+      "main": [
+        [
+          {
+            "node": "Budget Alert Due?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Budget Alert Due?": {
+      "main": [
+        [
+          {
+            "node": "Send Budget Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Budget Alert": {
+      "main": [
+        [
+          {
+            "node": "Mark Budget Alert Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Report Schedule": {
+      "main": [
+        [
+          {
+            "node": "Read Settings for Weekly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Expenses for Weekly Report": {
+      "main": [
+        [
+          {
+            "node": "Build Weekly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Weekly Report": {
+      "main": [
+        [
+          {
+            "node": "Prepare ReportLog weekly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Weekly Report": {
+      "main": [
+        [
+          {
+            "node": "ReportLog - weekly Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ReportLog - weekly Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monthly Report Schedule": {
+      "main": [
+        [
+          {
+            "node": "Read Settings for Monthly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Expenses for Monthly Report": {
+      "main": [
+        [
+          {
+            "node": "Build Monthly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Monthly Report": {
+      "main": [
+        [
+          {
+            "node": "Prepare ReportLog monthly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Monthly Report": {
+      "main": [
+        [
+          {
+            "node": "ReportLog - monthly Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ReportLog - monthly Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report Request?": {
+      "main": [
+        [
+          {
+            "node": "Weekly Report Request?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Expense Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Report Request?": {
+      "main": [
+        [
+          {
+            "node": "Read Expenses for Weekly Report",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Monthly Report Request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monthly Report Request?": {
+      "main": [
+        [
+          {
+            "node": "Read Expenses for Manual Monthly Report",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read Expenses for Daily Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Expenses for Manual Monthly Report": {
+      "main": [
+        [
+          {
+            "node": "Build Manual Monthly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Expenses for Daily Report": {
+      "main": [
+        [
+          {
+            "node": "Build Daily Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Manual Monthly Report": {
+      "main": [
+        [
+          {
+            "node": "Prepare ReportLog manual_monthly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Daily Report": {
+      "main": [
+        [
+          {
+            "node": "Prepare ReportLog daily",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Manual Monthly Report": {
+      "main": [
+        [
+          {
+            "node": "ReportLog - manual_monthly Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ReportLog - manual_monthly Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Daily Report": {
+      "main": [
+        [
+          {
+            "node": "ReportLog - daily Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ReportLog - daily Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Categories": {
+      "main": [
+        [
+          {
+            "node": "Parse Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare ReportLog weekly": {
+      "main": [
+        [
+          {
+            "node": "Send Weekly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare ReportLog monthly": {
+      "main": [
+        [
+          {
+            "node": "Send Monthly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare ReportLog manual_monthly": {
+      "main": [
+        [
+          {
+            "node": "Send Manual Monthly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare ReportLog daily": {
+      "main": [
+        [
+          {
+            "node": "Send Daily Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Settings for Weekly Report": {
+      "main": [
+        [
+          {
+            "node": "Prepare Weekly Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Weekly Settings": {
+      "main": [
+        [
+          {
+            "node": "Weekly Reports Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Reports Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Read Expenses for Weekly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Settings for Monthly Report": {
+      "main": [
+        [
+          {
+            "node": "Prepare Monthly Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Monthly Settings": {
+      "main": [
+        [
+          {
+            "node": "Monthly Reports Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monthly Reports Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Read Expenses for Monthly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Control Router": {
+      "main": [
+        [
+          {
+            "node": "Is Settings Command?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Settings Command?": {
+      "main": [
+        [
+          {
+            "node": "Read Settings for Control",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Settings for Control": {
+      "main": [
+        [
+          {
+            "node": "Read Categories for Control",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Categories for Control": {
+      "main": [
+        [
+          {
+            "node": "Parse Control Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Control Command": {
+      "main": [
+        [
+          {
+            "node": "Route Control Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Control Action": {
+      "main": [
+        [
+          {
+            "node": "Update Setting in Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Add Category to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Category in Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply - Control Help or Listing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Setting in Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Reply - Setting Updated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Category to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Reply - Category Added",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Category in Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Reply - Category Updated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Settings": {
+      "main": [
+        [
+          {
+            "node": "Pre-AI Auth Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-AI Auth Check": {
+      "main": [
+        [
+          {
+            "node": "Pre-AI Authorized?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-AI Authorized?": {
+      "main": [
+        [
+          {
+            "node": "Is Undo?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject Unauthorized (Pre-AI)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AuditLog - Unauthorized (Pre-AI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent - Understand Palestinian Arabic": {
+      "main": [
+        [
+          {
+            "node": "Read Categories",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Undo?": {
+      "main": [
+        [
+          {
+            "node": "Read Expenses for Undo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Insights?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Expenses for Undo": {
+      "main": [
+        [
+          {
+            "node": "Build Undo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Undo": {
+      "main": [
+        [
+          {
+            "node": "Anything to Undo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything to Undo?": {
+      "main": [
+        [
+          {
+            "node": "Reverse Expense",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply Nothing To Undo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reverse Expense": {
+      "main": [
+        [
+          {
+            "node": "Reply Undo",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AuditLog - Expense Undone",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply Undo Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Insights?": {
+      "main": [
+        [
+          {
+            "node": "Read Expenses for Insights",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Has Text?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Expenses for Insights": {
+      "main": [
+        [
+          {
+            "node": "Build Insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Insights": {
+      "main": [
+        [
+          {
+            "node": "Reply Insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Text?": {
+      "main": [
+        [
+          {
+            "node": "AI Agent - Understand Palestinian Arabic",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply Text Only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Notify Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Gaza"
+  },
+  "pinData": {}
+}
